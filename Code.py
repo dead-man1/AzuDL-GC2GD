@@ -25,7 +25,7 @@ class AzuDlGC2GD:
     def __init__(self):
         self.project_name = "AzuDl - GC2GD"
         self.project_subtitle = "Azizi Universal Downloader - Google Colab to Google Drive"
-        self.version = "1.2.1"
+        self.version = "1.2.8"
 
         self.drive_mount_path = Path("/content/drive")
         self.my_drive_path = self.drive_mount_path / "MyDrive"
@@ -38,6 +38,7 @@ class AzuDlGC2GD:
         self.archive_dir = self.base_dir / "Archives"
         self.logs_dir = self.base_dir / "Logs"
         self.history_file = self.logs_dir / "download_history.json"
+        self.aria2_session_file = self.logs_dir / "aria2.session"
 
         self.rpc_url = "http://localhost:6800/jsonrpc"
 
@@ -112,6 +113,9 @@ class AzuDlGC2GD:
         for item in dirs:
             item.mkdir(parents=True, exist_ok=True)
 
+        if not self.aria2_session_file.exists():
+            self.aria2_session_file.write_text("")
+
     def is_port_open(self, host="127.0.0.1", port=6800):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(1)
@@ -119,8 +123,29 @@ class AzuDlGC2GD:
 
     def start_aria2_rpc(self):
         if self.is_port_open():
-            print("aria2 RPC already running")
-            return
+            try:
+                options = self.rpc("aria2.getGlobalOption")
+                save_session = str(options.get("save-session", ""))
+                input_file = str(options.get("input-file", ""))
+
+                if str(self.aria2_session_file) in [save_session, input_file]:
+                    print("aria2 RPC already running")
+                    return
+
+                print("aria2 RPC is running with old options")
+                print("Restarting aria2 RPC")
+                try:
+                    self.rpc("aria2.shutdown")
+                    time.sleep(2)
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+        if self.is_port_open():
+            subprocess.run(["pkill", "-9", "aria2c"], check=False)
+            time.sleep(2)
 
         cmd = [
             "aria2c",
@@ -130,8 +155,15 @@ class AzuDlGC2GD:
             "--rpc-allow-origin-all=true",
             "--daemon=true",
             "--seed-time=0",
+            "--seed-ratio=0.0",
             "--file-allocation=none",
             "--continue=true",
+            "--always-resume=true",
+            "--auto-save-interval=10",
+            "--save-session-interval=10",
+            f"--input-file={self.aria2_session_file}",
+            f"--save-session={self.aria2_session_file}",
+            "--force-save=true",
             "--max-tries=0",
             "--retry-wait=10",
             "--timeout=60",
@@ -150,6 +182,7 @@ class AzuDlGC2GD:
         for _ in range(30):
             if self.is_port_open():
                 print("aria2 RPC started")
+                print("aria2 session:", self.aria2_session_file)
                 return
             time.sleep(0.5)
 
@@ -163,14 +196,35 @@ class AzuDlGC2GD:
             "params": params or []
         }
 
-        response = requests.post(self.rpc_url, json=payload, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+        response = requests.post(self.rpc_url, json=payload, timeout=30)
+
+        if response.status_code != 200:
+            message = response.text[:1000]
+            raise RuntimeError(f"aria2 RPC HTTP {response.status_code}: {message}")
+
+        try:
+            data = response.json()
+        except Exception:
+            raise RuntimeError(f"Invalid aria2 RPC response: {response.text[:1000]}")
 
         if "error" in data:
             raise RuntimeError(data["error"])
 
         return data["result"]
+
+    def save_aria2_session(self):
+        try:
+            result = self.rpc("aria2.saveSession")
+            print("aria2 session saved")
+            return result
+        except Exception as error:
+            message = str(error)
+
+            if "Filename is not given" in message:
+                return None
+
+            print("Failed to save aria2 session:", error)
+            return None
 
     def sanitize_name(self, name):
         name = str(name or "").strip()
@@ -187,6 +241,17 @@ class AzuDlGC2GD:
             value /= 1024
 
         return f"{value:.2f} PB"
+
+    def format_seconds(self, seconds):
+        seconds = int(seconds or 0)
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        return f"{minutes:02d}:{secs:02d}"
 
     def detect_link_type(self, value):
         value = str(value or "").strip()
@@ -261,6 +326,9 @@ class AzuDlGC2GD:
 
             if item.get("format"):
                 print("Format:", item.get("format"))
+
+            if item.get("seed") is not None:
+                print("Seed:", item.get("seed"))
 
             if item.get("error"):
                 print("Error:", item.get("error"))
@@ -389,6 +457,7 @@ class AzuDlGC2GD:
             "dir": str(save_dir),
             "file-allocation": "none",
             "continue": "true",
+            "always-resume": "true",
             "max-tries": "0",
             "retry-wait": "10",
             "timeout": "60",
@@ -406,7 +475,9 @@ class AzuDlGC2GD:
         if extra_options:
             options.update(extra_options)
 
-        return self.rpc("aria2.addUri", [uris, options])
+        gid = self.rpc("aria2.addUri", [uris, options])
+        self.save_aria2_session()
+        return gid
 
     def add_aria2_torrent(self, torrent_bytes, save_dir, speed_limit="", extra_options=None):
         torrent_base64 = base64.b64encode(torrent_bytes).decode("utf-8")
@@ -415,6 +486,7 @@ class AzuDlGC2GD:
             "dir": str(save_dir),
             "file-allocation": "none",
             "continue": "true",
+            "always-resume": "true",
             "max-tries": "0",
             "retry-wait": "10",
             "timeout": "60",
@@ -422,6 +494,7 @@ class AzuDlGC2GD:
             "allow-overwrite": "false",
             "auto-file-renaming": "true",
             "seed-time": "0",
+            "seed-ratio": "0.0",
             "enable-dht": "true",
             "enable-dht6": "true",
             "enable-peer-exchange": "true",
@@ -434,7 +507,158 @@ class AzuDlGC2GD:
         if extra_options:
             options.update(extra_options)
 
-        return self.rpc("aria2.addTorrent", [torrent_base64, [], options])
+        gid = self.rpc("aria2.addTorrent", [torrent_base64, [], options])
+        self.save_aria2_session()
+        return gid
+
+    def fetch_torrent_file_bytes(self, source):
+        source = source.strip()
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 AzuDl-GC2GD/1.2.8",
+            "Accept": "application/x-bittorrent,application/octet-stream,*/*"
+        }
+
+        if source.startswith(("http://", "https://")):
+            print("Downloading torrent file metadata")
+            response = requests.get(source, headers=headers, timeout=60, allow_redirects=True)
+            response.raise_for_status()
+            content = response.content
+        else:
+            path = Path(source)
+
+            if not path.exists():
+                raise FileNotFoundError(f"Torrent file not found: {path}")
+
+            content = path.read_bytes()
+
+        if not content:
+            raise ValueError("Torrent file is empty")
+
+        stripped = content.lstrip()
+
+        if not stripped.startswith(b"d"):
+            preview = content[:300].decode("utf-8", errors="replace")
+            raise ValueError(
+                "Downloaded file is not a valid .torrent file. "
+                "The server may have returned HTML, an error page, or blocked the request.\n"
+                f"Preview:\n{preview}"
+            )
+
+        return content
+
+    def skip_bencode_value(self, data, index):
+        token = data[index:index + 1]
+
+        if token == b"i":
+            end = data.index(b"e", index)
+            return end + 1
+
+        if token in [b"l", b"d"]:
+            index += 1
+
+            while data[index:index + 1] != b"e":
+                index = self.skip_bencode_value(data, index)
+
+            return index + 1
+
+        if token.isdigit():
+            colon = data.index(b":", index)
+            length = int(data[index:colon])
+            return colon + 1 + length
+
+        raise ValueError("Invalid bencode data")
+
+    def get_torrent_infohash(self, torrent_bytes):
+        data = torrent_bytes
+
+        if not data.startswith(b"d"):
+            return ""
+
+        index = 1
+
+        while index < len(data) and data[index:index + 1] != b"e":
+            key_start = index
+            key_end = self.skip_bencode_value(data, key_start)
+            key_data = data[key_start:key_end]
+
+            colon = key_data.index(b":")
+            key = key_data[colon + 1:]
+
+            value_start = key_end
+            value_end = self.skip_bencode_value(data, value_start)
+
+            if key == b"info":
+                return hashlib.sha1(data[value_start:value_end]).hexdigest()
+
+            index = value_end
+
+        return ""
+
+    def find_existing_torrent_by_infohash(self, infohash):
+        if not infohash:
+            return None
+
+        target = str(infohash).lower()
+        active, waiting, stopped = self.get_aria2_items()
+
+        for item in active + waiting + stopped:
+            bittorrent = item.get("bittorrent", {})
+            current = str(bittorrent.get("infoHash", "")).lower()
+
+            if current == target:
+                return item
+
+        return None
+
+    def remove_existing_torrent_gid(self, gid):
+        if not gid:
+            return False
+
+        try:
+            self.rpc("aria2.remove", [gid])
+            self.save_aria2_session()
+            return True
+        except Exception:
+            pass
+
+        try:
+            self.rpc("aria2.removeDownloadResult", [gid])
+            self.save_aria2_session()
+            return True
+        except Exception:
+            return False
+
+    def build_torrent_options(self, private=False, seed=False):
+        if seed:
+            seed_time = "525600"
+        else:
+            seed_time = "0"
+
+        if private:
+            return {
+                "seed-time": seed_time,
+                "seed-ratio": "0.0",
+                "enable-dht": "false",
+                "enable-dht6": "false",
+                "enable-peer-exchange": "false",
+                "bt-enable-lpd": "false",
+                "bt-save-metadata": "true",
+                "bt-load-saved-metadata": "true",
+                "bt-request-peer-speed-limit": "50K"
+            }
+
+        return {
+            "seed-time": seed_time,
+            "seed-ratio": "0.0",
+            "enable-dht": "true",
+            "enable-dht6": "true",
+            "enable-peer-exchange": "true",
+            "bt-enable-lpd": "true",
+            "bt-save-metadata": "true",
+            "bt-load-saved-metadata": "true",
+            "bt-request-peer-speed-limit": "50K"
+        }
 
     def get_aria2_status(self, gid):
         keys = [
@@ -444,8 +668,10 @@ class AzuDlGC2GD:
             "completedLength",
             "downloadSpeed",
             "uploadSpeed",
+            "uploadLength",
             "connections",
             "numSeeders",
+            "shareRatio",
             "errorCode",
             "errorMessage",
             "files",
@@ -464,8 +690,11 @@ class AzuDlGC2GD:
             "totalLength",
             "completedLength",
             "downloadSpeed",
+            "uploadSpeed",
+            "uploadLength",
             "connections",
             "numSeeders",
+            "shareRatio",
             "errorCode",
             "errorMessage",
             "files",
@@ -508,10 +737,16 @@ class AzuDlGC2GD:
                 total = int(item.get("totalLength", "0") or 0)
                 completed = int(item.get("completedLength", "0") or 0)
                 speed = int(item.get("downloadSpeed", "0") or 0)
+                upload_speed = int(item.get("uploadSpeed", "0") or 0)
+                uploaded = int(item.get("uploadLength", "0") or 0)
+                share_ratio = item.get("shareRatio", "0")
                 connections = item.get("connections", "0")
                 seeders = item.get("numSeeders", "0")
+                bittorrent = item.get("bittorrent", {})
+                infohash = bittorrent.get("infoHash", "")
 
                 percent = 0
+
                 if total > 0:
                     percent = completed * 100 / total
 
@@ -524,9 +759,13 @@ class AzuDlGC2GD:
                 print("GID:", gid)
                 print("Status:", status)
                 print("Name:", name or "unknown")
+                print("InfoHash:", infohash or "unknown")
                 print("Progress:", f"{percent:.2f}%")
                 print("Completed:", self.format_bytes(completed), "/", self.format_bytes(total))
-                print("Speed:", self.format_bytes(speed) + "/s")
+                print("Download Speed:", self.format_bytes(speed) + "/s")
+                print("Upload Speed:", self.format_bytes(upload_speed) + "/s")
+                print("Uploaded:", self.format_bytes(uploaded))
+                print("Ratio:", share_ratio)
                 print("Connections:", connections)
                 print("Seeders:", seeders)
 
@@ -538,6 +777,7 @@ class AzuDlGC2GD:
     def purge_aria2_stopped(self):
         try:
             result = self.rpc("aria2.purgeDownloadResult")
+            self.save_aria2_session()
             print("Stopped download results cleared")
             print(result)
         except Exception as error:
@@ -550,18 +790,12 @@ class AzuDlGC2GD:
             print("No GID entered")
             return
 
-        try:
-            result = self.rpc("aria2.remove", [gid])
-            print("Removed active/waiting download:", result)
-            return
-        except Exception:
-            pass
+        removed = self.remove_existing_torrent_gid(gid)
 
-        try:
-            result = self.rpc("aria2.removeDownloadResult", [gid])
-            print("Removed stopped download result:", result)
-        except Exception as error:
-            print("Failed to remove GID:", error)
+        if removed:
+            print("GID removed:", gid)
+        else:
+            print("Failed to remove GID:", gid)
 
     def find_real_torrent_gid(self, metadata_gid, save_dir):
         save_dir = str(save_dir)
@@ -627,6 +861,7 @@ class AzuDlGC2GD:
 
             if status.get("status") == "error":
                 bar.close()
+                self.save_aria2_session()
                 raise RuntimeError(status.get("errorMessage") or "Metadata fetch failed.")
 
             followed_by = status.get("followedBy", [])
@@ -636,6 +871,7 @@ class AzuDlGC2GD:
             if followed_by:
                 bar.update(1)
                 bar.close()
+                self.save_aria2_session()
                 return
 
             if files and total > 0:
@@ -645,20 +881,26 @@ class AzuDlGC2GD:
                 if info:
                     bar.update(1)
                     bar.close()
+                    self.save_aria2_session()
                     return
 
             if status.get("status") == "complete" and files and total > 0:
                 bar.update(1)
                 bar.close()
+                self.save_aria2_session()
                 return
 
             time.sleep(1)
 
-    def monitor_aria2(self, gid, label):
+    def monitor_aria2(self, gid, label, seed=False):
         last_completed = 0
         progress = None
         last_state = None
         printed_file = None
+        seeding_notice_printed = False
+        seed_started_at = None
+        seed_bar = None
+        last_session_save = time.time()
 
         while True:
             status = self.get_aria2_status(gid)
@@ -667,9 +909,16 @@ class AzuDlGC2GD:
             total = int(status.get("totalLength", "0") or 0)
             completed = int(status.get("completedLength", "0") or 0)
             speed = int(status.get("downloadSpeed", "0") or 0)
+            upload_speed = int(status.get("uploadSpeed", "0") or 0)
+            uploaded = int(status.get("uploadLength", "0") or 0)
             seeders = status.get("numSeeders", "0")
             connections = status.get("connections", "0")
+            share_ratio = status.get("shareRatio", "0")
             files = status.get("files", [])
+
+            if time.time() - last_session_save >= 30:
+                self.save_aria2_session()
+                last_session_save = time.time()
 
             if state != last_state:
                 print("Status:", state)
@@ -682,11 +931,14 @@ class AzuDlGC2GD:
                     printed_file = first_file
 
             if state == "error":
-                if progress:
+                if progress is not None:
                     progress.close()
+                if seed_bar is not None:
+                    seed_bar.close()
+                self.save_aria2_session()
                 raise RuntimeError(status.get("errorMessage") or "Download failed.")
 
-            if progress is None and total > 0:
+            if progress is None and total > 0 and not (seed and completed >= total):
                 progress = tqdm(
                     total=total,
                     unit="B",
@@ -695,7 +947,7 @@ class AzuDlGC2GD:
                     desc=label
                 )
 
-            if progress:
+            if progress is not None:
                 if completed < last_completed:
                     last_completed = 0
                     progress.n = 0
@@ -712,7 +964,10 @@ class AzuDlGC2GD:
 
                 postfix = {
                     "percent": f"{percent:.2f}%",
-                    "speed": self.format_bytes(speed) + "/s",
+                    "down": self.format_bytes(speed) + "/s",
+                    "up": self.format_bytes(upload_speed) + "/s",
+                    "uploaded": self.format_bytes(uploaded),
+                    "ratio": str(share_ratio),
                     "connections": connections
                 }
 
@@ -723,16 +978,60 @@ class AzuDlGC2GD:
 
             last_completed = completed
 
-            if state == "complete":
-                if progress:
+            if seed and total > 0 and completed >= total:
+                if seed_started_at is None:
+                    seed_started_at = time.time()
+
+                if not seeding_notice_printed:
+                    print("Download completed")
+                    print("Seeding is enabled")
+                    print("Keep this Colab runtime alive to continue seeding")
+                    print("Press interrupt if you want to stop seeding")
+                    seeding_notice_printed = True
+
+                    if progress is not None:
+                        progress.n = total
+                        progress.refresh()
+                        progress.close()
+                        progress = None
+
+                    seed_bar = tqdm(
+                        total=1,
+                        unit="step",
+                        desc="Seeding Upload"
+                    )
+
+                    self.save_aria2_session()
+
+                if seed_bar is not None:
+                    elapsed = self.format_seconds(time.time() - seed_started_at)
+
+                    seed_bar.n = 0
+                    seed_bar.set_postfix({
+                        "up": self.format_bytes(upload_speed) + "/s",
+                        "uploaded": self.format_bytes(uploaded),
+                        "ratio": str(share_ratio),
+                        "connections": connections,
+                        "seeders": seeders,
+                        "time": elapsed
+                    })
+                    seed_bar.refresh()
+
+            if state == "complete" and not seed:
+                if progress is not None:
                     progress.n = total
                     progress.refresh()
                     progress.close()
+                self.save_aria2_session()
                 return status
+
+            if state == "complete" and seed:
+                time.sleep(5)
+                continue
 
             time.sleep(1)
 
-    def download_magnet(self, magnet, folder_name="", speed_limit=""):
+    def download_magnet(self, magnet, folder_name="", speed_limit="", private=False, seed=False):
         magnet = magnet.strip()
         folder_name = self.sanitize_name(folder_name)
         save_dir = self.torrent_dir / folder_name
@@ -741,22 +1040,18 @@ class AzuDlGC2GD:
         if not magnet.startswith("magnet:?xt=urn:btih:"):
             raise ValueError("Invalid magnet link.")
 
-        options = {
-            "seed-time": "0",
-            "enable-dht": "true",
-            "enable-dht6": "true",
-            "enable-peer-exchange": "true",
-            "bt-enable-lpd": "true",
-            "bt-save-metadata": "true",
-            "bt-load-saved-metadata": "true",
-            "bt-request-peer-speed-limit": "50K"
-        }
+        options = self.build_torrent_options(
+            private=private,
+            seed=seed
+        )
 
         gid = self.add_aria2_download([magnet], save_dir, speed_limit, options)
 
         print("Magnet added")
         print("Output:", save_dir)
         print("Metadata GID:", gid)
+        print("Private mode:", "enabled" if private else "disabled")
+        print("Seeding:", "enabled" if seed else "disabled")
 
         self.wait_for_torrent_metadata(gid)
 
@@ -765,54 +1060,233 @@ class AzuDlGC2GD:
         print("Starting torrent download monitor")
         print("Download GID:", real_gid)
 
-        self.monitor_aria2(real_gid, "Torrent Download")
+        self.monitor_aria2(real_gid, "Torrent Download", seed=seed)
 
         self.save_history({
-            "type": "torrent",
+            "type": "private_torrent_magnet" if private else "torrent",
             "source": magnet,
             "output": str(save_dir),
-            "status": "completed"
+            "status": "completed",
+            "seed": seed
         })
 
         print("Download completed")
         print("Saved to:", save_dir)
 
-    def download_torrent_file(self, source, folder_name="", speed_limit=""):
+    def download_torrent_file(self, source, folder_name="", speed_limit="", private=False, seed=False):
         source = source.strip()
         folder_name = self.sanitize_name(folder_name)
         save_dir = self.torrent_dir / folder_name
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        if source.startswith(("http://", "https://")):
-            print("Downloading torrent file metadata")
-            response = requests.get(source, timeout=60)
-            response.raise_for_status()
-            torrent_bytes = response.content
-        else:
-            path = Path(source)
+        torrent_bytes = self.fetch_torrent_file_bytes(source)
+        infohash = self.get_torrent_infohash(torrent_bytes)
 
-            if not path.exists():
-                raise FileNotFoundError(f"Torrent file not found: {path}")
+        if infohash:
+            print("Torrent InfoHash:", infohash)
 
-            torrent_bytes = path.read_bytes()
+            existing = self.find_existing_torrent_by_infohash(infohash)
 
-        gid = self.add_aria2_torrent(torrent_bytes, save_dir, speed_limit)
+            if existing:
+                existing_gid = existing.get("gid")
+                existing_status = existing.get("status", "unknown")
+
+                print("This torrent is already registered in aria2")
+                print("Existing GID:", existing_gid)
+                print("Existing status:", existing_status)
+
+                if existing_status == "error":
+                    print("Existing torrent is in error state")
+                    print("Removing old GID and adding again")
+                    removed = self.remove_existing_torrent_gid(existing_gid)
+
+                    if not removed:
+                        raise RuntimeError("Could not remove existing errored torrent GID")
+
+                else:
+                    print("Using existing torrent instead of adding duplicate")
+                    self.monitor_aria2(existing_gid, "Torrent Resume", seed=seed)
+
+                    self.save_history({
+                        "type": "private_torrent_file_resume" if private else "torrent_file_resume",
+                        "source": source,
+                        "output": str(save_dir),
+                        "status": "resumed",
+                        "seed": seed
+                    })
+
+                    print("Torrent handled with existing GID")
+                    return
+
+        options = self.build_torrent_options(
+            private=private,
+            seed=seed
+        )
+
+        try:
+            gid = self.add_aria2_torrent(torrent_bytes, save_dir, speed_limit, options)
+        except Exception as error:
+            message = str(error)
+
+            if "already registered" in message:
+                print("This torrent is already registered in aria2.")
+                print("Open Torrent Tools > aria2 status, remove the existing GID, then try again.")
+                raise RuntimeError(message)
+
+            debug_file = self.logs_dir / f"failed_torrent_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.torrent"
+            debug_file.write_bytes(torrent_bytes)
+
+            print("Failed to pass torrent data to aria2")
+            print("Saved downloaded .torrent for debugging:")
+            print(debug_file)
+
+            raise error
 
         print("Torrent file added")
         print("Output:", save_dir)
         print("Download GID:", gid)
+        print("Private mode:", "enabled" if private else "disabled")
+        print("Seeding:", "enabled" if seed else "disabled")
 
-        self.monitor_aria2(gid, "Torrent File Download")
+        try:
+            self.monitor_aria2(gid, "Torrent File Download", seed=seed)
+        except Exception as error:
+            message = str(error)
+
+            if "already registered" in message:
+                print("Duplicate torrent detected after adding")
+                print("Removing duplicate GID:", gid)
+                self.remove_existing_torrent_gid(gid)
+                raise RuntimeError("Torrent already exists in aria2. Removed duplicate GID. Try again or use aria2 status.")
+
+            raise error
 
         self.save_history({
-            "type": "torrent_file",
+            "type": "private_torrent_file" if private else "torrent_file",
             "source": source,
             "output": str(save_dir),
-            "status": "completed"
+            "status": "completed",
+            "seed": seed
         })
 
         print("Download completed")
         print("Saved to:", save_dir)
+
+    def download_private_torrent(self):
+        print("Private Torrent")
+        print("-" * 80)
+        print("Recommended: use a .torrent file from your private tracker.")
+        print("Private mode disables DHT, DHT6, PEX, and LPD.")
+        print("Seeding works only while the Colab runtime is alive.")
+        print("For long-term seeding, use a seedbox or VPS.")
+        print("-" * 80)
+
+        source = input("Private .torrent URL, local path, or magnet: ").strip()
+        folder_name = input("Folder name optional: ").strip()
+        speed_limit = input("Speed limit optional, example 5M: ").strip()
+        seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+        seed = seed_answer == "y"
+
+        if not source:
+            print("No torrent source entered")
+            return
+
+        if source.startswith("magnet:?"):
+            print("Warning: magnet links are not recommended for private torrents.")
+            print("A .torrent file is strongly recommended for private trackers.")
+            self.download_magnet(
+                magnet=source,
+                folder_name=folder_name,
+                speed_limit=speed_limit,
+                private=True,
+                seed=seed
+            )
+            return
+
+        self.download_torrent_file(
+            source=source,
+            folder_name=folder_name,
+            speed_limit=speed_limit,
+            private=True,
+            seed=seed
+        )
+
+    def torrent_menu(self):
+        while True:
+            print("")
+            print("=" * 70)
+            print("Torrent Tools")
+            print("=" * 70)
+            print("1. Torrent magnet")
+            print("2. Torrent file")
+            print("3. Private torrent")
+            print("4. aria2 status")
+            print("5. Remove aria2 GID")
+            print("6. Clear stopped aria2 results")
+            print("7. Save aria2 session")
+            print("8. Back")
+
+            choice = input("Select torrent option: ").strip()
+
+            try:
+                if choice == "1":
+                    magnet = input("Magnet link: ").strip()
+                    folder_name = input("Folder name optional: ").strip()
+                    speed_limit = input("Speed limit optional, example 5M: ").strip()
+                    seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+                    seed = seed_answer == "y"
+
+                    self.download_magnet(
+                        magnet=magnet,
+                        folder_name=folder_name,
+                        speed_limit=speed_limit,
+                        private=False,
+                        seed=seed
+                    )
+
+                elif choice == "2":
+                    source = input("Torrent file URL or path: ").strip()
+                    folder_name = input("Folder name optional: ").strip()
+                    speed_limit = input("Speed limit optional, example 5M: ").strip()
+                    seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+                    seed = seed_answer == "y"
+
+                    self.download_torrent_file(
+                        source=source,
+                        folder_name=folder_name,
+                        speed_limit=speed_limit,
+                        private=False,
+                        seed=seed
+                    )
+
+                elif choice == "3":
+                    self.download_private_torrent()
+
+                elif choice == "4":
+                    self.print_aria2_status()
+
+                elif choice == "5":
+                    self.remove_aria2_gid()
+
+                elif choice == "6":
+                    self.purge_aria2_stopped()
+
+                elif choice == "7":
+                    self.save_aria2_session()
+
+                elif choice == "8":
+                    break
+
+                else:
+                    print("Invalid torrent option")
+
+            except KeyboardInterrupt:
+                self.save_aria2_session()
+                print("Cancelled")
+
+            except Exception as error:
+                self.save_aria2_session()
+                print("Error:", error)
 
     def parse_headers_json(self, text):
         text = str(text or "").strip()
@@ -1113,11 +1587,29 @@ class AzuDlGC2GD:
 
         if link_type == "torrent":
             speed_limit = input("Speed limit optional, example 5M: ").strip()
-            self.download_magnet(value, folder_name, speed_limit)
+            seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+            seed = seed_answer == "y"
+
+            self.download_magnet(
+                value,
+                folder_name,
+                speed_limit,
+                private=False,
+                seed=seed
+            )
 
         elif link_type == "torrent_file":
             speed_limit = input("Speed limit optional, example 5M: ").strip()
-            self.download_torrent_file(value, folder_name, speed_limit)
+            seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+            seed = seed_answer == "y"
+
+            self.download_torrent_file(
+                value,
+                folder_name,
+                speed_limit,
+                private=False,
+                seed=seed
+            )
 
         elif link_type == "youtube":
             show_formats = input("Show available formats? y/n: ").strip().lower()
@@ -1189,10 +1681,10 @@ class AzuDlGC2GD:
 
             try:
                 if link_type == "torrent":
-                    self.download_magnet(link, batch_folder, speed_limit)
+                    self.download_magnet(link, batch_folder, speed_limit, private=False, seed=False)
 
                 elif link_type == "torrent_file":
-                    self.download_torrent_file(link, batch_folder, speed_limit)
+                    self.download_torrent_file(link, batch_folder, speed_limit, private=False, seed=False)
 
                 elif link_type == "youtube":
                     self.download_youtube(
@@ -1427,99 +1919,61 @@ Azizi Universal Downloader - Google Colab to Google Drive
 
 Main options:
 1. Auto detect link
-2. Torrent magnet
-3. Torrent file
-4. YouTube video or playlist
-5. Direct link
-6. Batch download
-7. Download history
-8. List downloaded files
-9. Storage report
-10. SHA256 latest file
-11. SHA256 selected file
-12. ZIP folder
-13. ZIP latest folder
-14. aria2 status
-15. Remove aria2 GID
-16. Clear stopped aria2 results
-17. Latest file
-18. Developer
-19. Help
-20. Exit
+2. Torrent tools
+3. YouTube video or playlist
+4. Direct link
+5. Batch download
+6. Download history
+7. List downloaded files
+8. Storage report
+9. SHA256 latest file
+10. SHA256 selected file
+11. ZIP folder
+12. ZIP latest folder
+13. Latest file
+14. Developer
+15. Help
+16. Exit
+
+Torrent tools:
+1. Torrent magnet
+2. Torrent file
+3. Private torrent
+4. aria2 status
+5. Remove aria2 GID
+6. Clear stopped aria2 results
+7. Save aria2 session
+8. Back
+
+Resume support:
+AzuDl uses aria2 session persistence.
+Session file:
+/content/drive/MyDrive/AzuDl-GC2GD/Logs/aria2.session
+
+Duplicate torrent handling:
+AzuDl reads torrent InfoHash before adding .torrent files.
+If the same torrent already exists in aria2, it resumes or monitors the existing GID instead of adding a duplicate.
+If the existing torrent is in error state, AzuDl removes it and adds the torrent again.
+
+Google Colab may disconnect idle or long-running sessions.
+AzuDl does not bypass Colab timeout.
+After reconnecting, run the notebook again and check aria2 status.
+
+Private torrent:
+Use this option for private tracker torrents.
+Using a .torrent file is strongly recommended.
+Private mode disables DHT, DHT6, PEX, and LPD.
+If seeding is enabled, aria2 keeps seeding while the Colab runtime is alive.
+Google Colab is not suitable for permanent seeding.
+For long-term seeding, use a seedbox or VPS.
+
+Torrent seeding:
+AzuDl uses 525600 minutes when seeding is enabled.
+Live seeding status shows upload speed, uploaded size, ratio, connections, seeders, and elapsed time.
 
 YouTube audio debug:
 YouTube often provides high quality video and audio as separate streams.
 If you select a video-only custom format ID, AzuDl tries to add best available audio automatically.
-
-Wrong example:
-137
-
-Better example:
-137+140
-
-Automatic behavior:
-137 -> 137+ba/best
-
-Auto detect:
-Paste any supported link.
-The app detects magnet, torrent file, YouTube URL, or direct URL automatically.
-
-Torrent update:
-Magnet links show the real file download progress after metadata is fetched.
-
-Storage paths:
-Base:
-/content/drive/MyDrive/AzuDl-GC2GD
-
-Torrent files:
-/content/drive/MyDrive/AzuDl-GC2GD/TorrentDownloads
-
-YouTube files:
-/content/drive/MyDrive/AzuDl-GC2GD/YouTubeDownloads
-
-Direct files:
-/content/drive/MyDrive/AzuDl-GC2GD/DirectDownloads
-
-Batch files:
-/content/drive/MyDrive/AzuDl-GC2GD/BatchDownloads
-
-Archives:
-/content/drive/MyDrive/AzuDl-GC2GD/Archives
-
-Logs:
-/content/drive/MyDrive/AzuDl-GC2GD/Logs
-
-Torrent magnet example:
-magnet:?xt=urn:btih:EXAMPLE_HASH
-
-Torrent file:
-Use a .torrent URL or a local .torrent path.
-
-YouTube quality values:
-best
-4320
-2160
-1440
-1080
-720
-480
-360
-
-YouTube custom format examples:
-137+140
-248+251
-22
-18
-best
-
-YouTube audio:
-Select audio only to save MP3 audio.
-
-Direct link examples:
-https://example.com/file.zip
-https://example.com/video.mp4
-https://example.com/archive.rar
-https://example.com/document.pdf
 
 Direct headers:
 You can pass optional headers as JSON.
@@ -1531,22 +1985,9 @@ Speed limit examples:
 2M
 10M
 
-Folder name:
-Leave empty to auto-create a folder name.
-
-File name:
-Available for direct links.
-Leave empty to keep the original file name.
-
-Batch download:
-Paste multiple links.
-Empty line starts the batch process.
-
 Notes:
 Use only content you have the right to download.
-Some YouTube videos may require cookies or may not be available in Colab.
-Some direct links may require headers, authentication, or temporary tokens.
-Torrent speed depends on seeders and peers.
+Private torrent seeding stops when Colab runtime disconnects.
 """
         print(text.strip())
 
@@ -1566,25 +2007,21 @@ def main():
         print(app.project_name)
         print("=" * 70)
         print("1. Auto detect link")
-        print("2. Torrent magnet")
-        print("3. Torrent file")
-        print("4. YouTube video or playlist")
-        print("5. Direct link")
-        print("6. Batch download")
-        print("7. Download history")
-        print("8. List downloaded files")
-        print("9. Storage report")
-        print("10. SHA256 latest file")
-        print("11. SHA256 selected file")
-        print("12. ZIP folder")
-        print("13. ZIP latest folder")
-        print("14. aria2 status")
-        print("15. Remove aria2 GID")
-        print("16. Clear stopped aria2 results")
-        print("17. Latest file")
-        print("18. Developer")
-        print("19. Help")
-        print("20. Exit")
+        print("2. Torrent tools")
+        print("3. YouTube video or playlist")
+        print("4. Direct link")
+        print("5. Batch download")
+        print("6. Download history")
+        print("7. List downloaded files")
+        print("8. Storage report")
+        print("9. SHA256 latest file")
+        print("10. SHA256 selected file")
+        print("11. ZIP folder")
+        print("12. ZIP latest folder")
+        print("13. Latest file")
+        print("14. Developer")
+        print("15. Help")
+        print("16. Exit")
 
         choice = input("Select option: ").strip()
 
@@ -1594,18 +2031,9 @@ def main():
                 app.auto_download(value)
 
             elif choice == "2":
-                magnet = input("Magnet link: ").strip()
-                folder_name = input("Folder name optional: ").strip()
-                speed_limit = input("Speed limit optional, example 5M: ").strip()
-                app.download_magnet(magnet, folder_name, speed_limit)
+                app.torrent_menu()
 
             elif choice == "3":
-                source = input("Torrent file URL or path: ").strip()
-                folder_name = input("Folder name optional: ").strip()
-                speed_limit = input("Speed limit optional, example 5M: ").strip()
-                app.download_torrent_file(source, folder_name, speed_limit)
-
-            elif choice == "4":
                 url = input("YouTube URL: ").strip()
                 folder_name = input("Folder name optional: ").strip()
                 show_formats = input("Show available formats? y/n: ").strip().lower()
@@ -1637,7 +2065,7 @@ def main():
                     metadata=metadata
                 )
 
-            elif choice == "5":
+            elif choice == "4":
                 url = input("Direct URL: ").strip()
                 folder_name = input("Folder name optional: ").strip()
                 file_name = input("File name optional: ").strip()
@@ -1646,49 +2074,41 @@ def main():
                 headers = app.parse_headers_json(headers_text)
                 app.download_direct(url, folder_name, file_name, speed_limit, headers)
 
-            elif choice == "6":
+            elif choice == "5":
                 app.batch_download()
 
-            elif choice == "7":
+            elif choice == "6":
                 app.print_history()
 
-            elif choice == "8":
+            elif choice == "7":
                 app.list_downloads()
 
-            elif choice == "9":
+            elif choice == "8":
                 app.storage_report()
 
-            elif choice == "10":
+            elif choice == "9":
                 app.hash_latest_file()
 
-            elif choice == "11":
+            elif choice == "10":
                 app.sha256_selected_file()
 
-            elif choice == "12":
+            elif choice == "11":
                 app.zip_folder()
 
-            elif choice == "13":
+            elif choice == "12":
                 app.zip_latest_folder()
 
-            elif choice == "14":
-                app.print_aria2_status()
-
-            elif choice == "15":
-                app.remove_aria2_gid()
-
-            elif choice == "16":
-                app.purge_aria2_stopped()
-
-            elif choice == "17":
+            elif choice == "13":
                 app.print_latest_file()
 
-            elif choice == "18":
+            elif choice == "14":
                 app.print_developer()
 
-            elif choice == "19":
+            elif choice == "15":
                 app.print_help()
 
-            elif choice == "20":
+            elif choice == "16":
+                app.save_aria2_session()
                 print("Exit")
                 break
 
@@ -1696,9 +2116,11 @@ def main():
                 print("Invalid option")
 
         except KeyboardInterrupt:
+            app.save_aria2_session()
             print("Cancelled")
 
         except Exception as error:
+            app.save_aria2_session()
             print("Error:", error)
 
 
