@@ -57,17 +57,6 @@ Version: 1.3.0 GUI Beta
 
 ---
 
-## What Is New in v1.3.0 GUI Beta
-
-Version `1.3.8` focuses on Bringing a unique GUI for the Script.
-
-AzuDl Added Colab widget-based GUI beta, tab-based dashboard, GUI tabs for Auto, Direct, YouTube, Torrent, Batch, Files, Archives, Maintenance, Developer, and Guide, Google Drive storage cards and usage bar in the GUI, GUI output console, GUI buttons for common actions.
-
-Also Added GUI access to cookie help and PO Token help, Keeping the classic CLI available but Setting GUI as the default interface
-
-and some more Improvements to public GitHub usability for new users
----
-
 ## <img src="https://img.shields.io/badge/v1.3.0-GUI%20Beta-5865F2?style=for-the-badge" alt="v1.3.0 GUI Beta">
 
 > [!IMPORTANT]
