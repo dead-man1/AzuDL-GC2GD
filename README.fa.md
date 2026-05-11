@@ -928,12 +928,6 @@ feat(gui): add Colab widget interface beta
 
 ## License
 
-لایسنسی را انتخاب کنید که با سیاست مخزن شما سازگار است.
-
-گزینه‌های پیشنهادی open-source:
-
 ```text
 MIT
-Apache-2.0
-GPL-3.0
 ```
