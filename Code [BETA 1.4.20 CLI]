@@ -1,0 +1,3019 @@
+import os
+import re
+import json
+import time
+import socket
+import base64
+import shutil
+import hashlib
+import subprocess
+import sys
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse
+
+
+def run_bootstrap_command(cmd, label):
+    print(label)
+    subprocess.run(cmd, check=True)
+
+
+def ensure_system_tools():
+    missing = []
+
+    for tool in ["aria2c", "ffmpeg", "7z"]:
+        if shutil.which(tool) is None:
+            missing.append(tool)
+
+    if missing:
+        run_bootstrap_command(["apt-get", "update", "-qq"], "Updating apt package index")
+        run_bootstrap_command(["apt-get", "install", "-y", "aria2", "ffmpeg", "p7zip-full"], "Installing system packages")
+
+
+def ensure_python_package(import_name, package_name=None):
+    package_name = package_name or import_name
+
+    try:
+        __import__(import_name)
+    except ModuleNotFoundError:
+        run_bootstrap_command([sys.executable, "-m", "pip", "install", "-q", package_name], "Installing Python package: " + package_name)
+
+
+ensure_system_tools()
+ensure_python_package("requests")
+ensure_python_package("tqdm")
+ensure_python_package("yt_dlp", "yt-dlp")
+
+import requests
+from tqdm.notebook import tqdm
+from google.colab import drive
+from yt_dlp import YoutubeDL
+
+
+class AzuDlGC2GD:
+    def __init__(self):
+        self.project_name = "AzuDl - GC2GD"
+        self.project_subtitle = "Azizi Universal Downloader - Google Colab to Google Drive"
+        self.version = "1.4.20 CLI Full"
+
+        self.drive_mount_path = Path("/content/drive")
+        self.my_drive_path = self.drive_mount_path / "MyDrive"
+
+        self.base_dir = self.my_drive_path / "AzuDl-GC2GD"
+        self.torrent_dir = self.base_dir / "TorrentDownloads"
+        self.youtube_dir = self.base_dir / "YouTubeDownloads"
+        self.direct_dir = self.base_dir / "DirectDownloads"
+        self.batch_dir = self.base_dir / "BatchDownloads"
+        self.github_dir = self.base_dir / "GitHubDownloads"
+        self.archive_dir = self.base_dir / "Archives"
+        self.logs_dir = self.base_dir / "Logs"
+        self.temp_dir = Path("/content/AzuDl-GC2GD-Temp")
+        self.history_file = self.logs_dir / "download_history.json"
+        self.aria2_session_file = self.logs_dir / "aria2.session"
+        self.youtube_cookies_file = self.logs_dir / "youtube_cookies.txt"
+        self.youtube_po_token_file = self.logs_dir / "youtube_po_token.txt"
+        self.youtube_visitor_data_file = self.logs_dir / "youtube_visitor_data.txt"
+        self.github_token_file = self.logs_dir / "github_token.txt"
+
+        self.rpc_url = "http://localhost:6800/jsonrpc"
+        self.official_github_repo_url = "https://github.com/TheGreatAzizi/AzuDL-GC2GD"
+
+    def setup(self):
+        self.print_banner()
+        self.mount_google_drive()
+        self.prepare_directories()
+        self.print_drive_storage_banner()
+        self.start_aria2_rpc()
+
+    def print_banner(self):
+        print("=" * 70)
+        print(self.project_name)
+        print(self.project_subtitle)
+        print("Version:", self.version)
+        print("=" * 70)
+
+    def mount_google_drive(self):
+        if self.my_drive_path.exists():
+            print("Google Drive already mounted")
+            return
+
+        attempts = [
+            {"force_remount": False, "label": "standard mount"},
+            {"force_remount": True, "label": "force remount"}
+        ]
+
+        last_error = None
+
+        for attempt in attempts:
+            try:
+                print("Trying Google Drive", attempt["label"])
+                drive.mount(str(self.drive_mount_path), force_remount=attempt["force_remount"])
+
+                if self.my_drive_path.exists():
+                    print("Google Drive mounted successfully")
+                    return
+
+            except Exception as error:
+                last_error = error
+                print("Mount attempt failed:", error)
+                time.sleep(2)
+
+        self.print_drive_mount_help()
+        raise RuntimeError(f"Google Drive mount failed: {last_error}")
+
+    def print_drive_mount_help(self):
+        print("")
+        print("=" * 70)
+        print("Google Drive mount failed")
+        print("=" * 70)
+        print("Try these fixes:")
+        print("1. Runtime > Restart session")
+        print("2. Run this in a separate cell: from google.colab import drive; drive.flush_and_unmount()")
+        print("3. Use only one Google account in your browser")
+        print("4. Open Colab in Incognito mode")
+        print("5. Make sure third-party cookies are not blocked")
+        print("6. Reconnect Google Drive manually from the Colab file panel")
+        print("=" * 70)
+        print("")
+
+    def prepare_directories(self):
+        dirs = [
+            self.base_dir,
+            self.torrent_dir,
+            self.youtube_dir,
+            self.direct_dir,
+            self.batch_dir,
+            self.github_dir,
+            self.archive_dir,
+            self.logs_dir
+        ]
+
+        for item in dirs:
+            item.mkdir(parents=True, exist_ok=True)
+
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.aria2_session_file.exists():
+            self.aria2_session_file.write_text("")
+
+        self.ensure_text_template(self.youtube_cookies_file, "# Netscape cookies.txt template\n")
+        self.ensure_text_template(self.youtube_po_token_file, "# Optional YouTube PO Token, example: mweb+YOUR_PO_TOKEN\n")
+        self.ensure_text_template(self.youtube_visitor_data_file, "# Optional YouTube Visitor Data\n")
+        self.ensure_text_template(self.github_token_file, "# Optional GitHub token\n")
+
+    def print_section(self, title):
+        print("")
+        print("=" * 70)
+        print(title)
+        print("=" * 70)
+
+    def print_subsection(self, title):
+        print("")
+        print("-" * 70)
+        print(title)
+        print("-" * 70)
+
+    def print_status(self, message, level="info"):
+        labels = {
+            "info": "INFO",
+            "success": "DONE",
+            "warning": "WARN",
+            "error": "ERROR"
+        }
+        print(f"[{labels.get(level, 'INFO')}] {message}")
+
+    def print_kv(self, key, value):
+        print(f"{key}: {value}")
+
+    def ensure_text_template(self, path, text):
+        path = Path(path)
+
+        if path.exists():
+            return
+
+        path.write_text(text)
+
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+
+    def read_first_useful_line(self, path):
+        path = Path(path)
+
+        if not path.exists():
+            return ""
+
+        try:
+            for line in path.read_text().splitlines():
+                line = line.strip()
+
+                if not line or line.startswith("#"):
+                    continue
+
+                return line
+        except Exception:
+            return ""
+
+        return ""
+
+    def print_drive_storage_banner(self):
+        total, used, free = shutil.disk_usage(str(self.my_drive_path))
+        used_percent = used * 100 / total if total else 0
+
+        self.print_section("Google Drive Storage")
+        self.print_kv("Total", self.format_bytes(total))
+        self.print_kv("Used", f"{self.format_bytes(used)} ({used_percent:.2f}%)")
+        self.print_kv("Free", self.format_bytes(free))
+
+    def force_drive_sync(self):
+        try:
+            subprocess.run(["sync"], check=False)
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+    def ensure_drive_ready(self):
+        if not self.my_drive_path.exists():
+            raise RuntimeError("Google Drive is not mounted.")
+
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        test_file = self.logs_dir / ".azudl_drive_write_test"
+
+        try:
+            test_file.write_text("ok")
+            if not test_file.exists() or test_file.read_text() != "ok":
+                raise RuntimeError("Google Drive write test failed.")
+        finally:
+            try:
+                test_file.unlink()
+            except Exception:
+                pass
+
+    def wait_file_stable(self, path, checks=3, delay=0.75):
+        path = Path(path)
+
+        if not path.exists() or not path.is_file():
+            return False
+
+        last_size = -1
+        stable_count = 0
+
+        for _ in range(max(checks * 4, 8)):
+            try:
+                current_size = path.stat().st_size
+            except Exception:
+                return False
+
+            if current_size > 0 and current_size == last_size:
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            if stable_count >= checks:
+                return True
+
+            last_size = current_size
+            time.sleep(delay)
+
+        return False
+
+    def is_temporary_output_file(self, path):
+        path = Path(path)
+        name = path.name.lower()
+        suffix = path.suffix.lower()
+
+        if suffix in [".part", ".ytdl", ".temp", ".tmp", ".aria2"]:
+            return True
+
+        if name.endswith(".part") or name.endswith(".ytdl") or name.endswith(".tmp"):
+            return True
+
+        return False
+
+    def get_unique_destination(self, destination):
+        destination = Path(destination)
+
+        if not destination.exists():
+            return destination
+
+        stem = destination.stem
+        suffix = destination.suffix
+        parent = destination.parent
+        counter = 1
+
+        while True:
+            candidate = parent / f"{stem}_{counter}{suffix}"
+
+            if not candidate.exists():
+                return candidate
+
+            counter += 1
+
+    def verify_drive_file_visible(self, path, expected_size=None, timeout=45):
+        path = Path(path)
+        start = time.time()
+
+        while time.time() - start < timeout:
+            try:
+                if path.exists() and path.is_file():
+                    size = path.stat().st_size
+
+                    if size > 0 and (expected_size is None or size == expected_size):
+                        with path.open("rb") as handle:
+                            handle.read(1)
+
+                        return True
+            except Exception:
+                pass
+
+            self.force_drive_sync()
+            time.sleep(1)
+
+        return False
+
+    def safe_transfer_to_drive(self, source, destination_dir, remove_source=True):
+        source = Path(source)
+        destination_dir = Path(destination_dir)
+
+        if not source.exists() or not source.is_file():
+            raise FileNotFoundError(f"Source file does not exist: {source}")
+
+        if self.is_temporary_output_file(source):
+            return None
+
+        if not self.wait_file_stable(source):
+            raise RuntimeError(f"Source file is not stable or is incomplete: {source}")
+
+        self.ensure_drive_ready()
+        destination_dir.mkdir(parents=True, exist_ok=True)
+
+        source_size = source.stat().st_size
+        destination = destination_dir / self.sanitize_name(source.name)
+        destination = self.get_unique_destination(destination)
+        tmp_destination = destination.with_name(destination.name + ".azudl_copying")
+
+        if tmp_destination.exists():
+            try:
+                tmp_destination.unlink()
+            except Exception:
+                pass
+
+        with source.open("rb") as src_handle:
+            with tmp_destination.open("wb") as dst_handle:
+                with tqdm(total=source_size, unit="B", unit_scale=True, unit_divisor=1024, desc="Drive copy") as bar:
+                    while True:
+                        chunk = src_handle.read(1024 * 1024)
+
+                        if not chunk:
+                            break
+
+                        dst_handle.write(chunk)
+                        bar.update(len(chunk))
+
+                dst_handle.flush()
+                os.fsync(dst_handle.fileno())
+
+        if not tmp_destination.exists() or tmp_destination.stat().st_size != source_size:
+            raise RuntimeError(f"Google Drive temporary copy verification failed for: {source}")
+
+        tmp_destination.replace(destination)
+        self.force_drive_sync()
+
+        if not self.verify_drive_file_visible(destination, expected_size=source_size, timeout=60):
+            raise RuntimeError(f"File was copied but could not be verified on Google Drive mount: {destination}")
+
+        if remove_source:
+            try:
+                source.unlink()
+            except Exception:
+                pass
+
+        return destination
+
+    def collect_final_files(self, folder):
+        folder = Path(folder)
+
+        if not folder.exists():
+            return []
+
+        files = []
+
+        for item in folder.glob("**/*"):
+            if item.is_file() and not self.is_temporary_output_file(item):
+                try:
+                    if item.stat().st_size > 0:
+                        files.append(item)
+                except Exception:
+                    pass
+
+        return sorted(files, key=lambda item: item.stat().st_mtime, reverse=True)
+
+    def transfer_folder_contents_to_drive(self, source_dir, destination_dir):
+        source_dir = Path(source_dir)
+        transferred = []
+
+        if not source_dir.exists():
+            return transferred
+
+        files = self.collect_final_files(source_dir)
+
+        for item in files:
+            moved = self.safe_transfer_to_drive(item, destination_dir, remove_source=True)
+
+            if moved:
+                transferred.append(moved)
+
+        try:
+            shutil.rmtree(source_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        return transferred
+
+    def verify_output_files(self, folder, label="download", min_count=1):
+        folder = Path(folder)
+        files = self.collect_final_files(folder)
+
+        if len(files) < min_count:
+            raise RuntimeError(f"{label} finished, but no valid output file was found in: {folder}")
+
+        self.print_subsection("Verified Output Files")
+
+        for item in files[:20]:
+            print(f"{self.format_bytes(item.stat().st_size):<12} {item}")
+
+        if len(files) > 20:
+            print(" - ...", len(files) - 20, "more files")
+
+        return files
+
+    def verify_aria2_status_files(self, status, label="aria2 download"):
+        files = status.get("files", []) if status else []
+        verified = []
+
+        for file_item in files:
+            path = file_item.get("path", "")
+
+            if not path:
+                continue
+
+            item = Path(path)
+
+            if item.exists() and item.is_file() and item.stat().st_size > 0:
+                verified.append(item)
+
+        if not verified:
+            raise RuntimeError(f"{label} completed, but aria2 output files were not found on Google Drive.")
+
+        self.print_subsection("Verified aria2 Files")
+
+        for item in verified[:20]:
+            print(f"{self.format_bytes(item.stat().st_size):<12} {item}")
+
+        if len(verified) > 20:
+            print(" - ...", len(verified) - 20, "more files")
+
+        return verified
+
+    def is_port_open(self, host="127.0.0.1", port=6800):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            return s.connect_ex((host, port)) == 0
+
+    def start_aria2_rpc(self):
+        if self.is_port_open():
+            try:
+                options = self.rpc("aria2.getGlobalOption")
+                save_session = str(options.get("save-session", ""))
+                input_file = str(options.get("input-file", ""))
+
+                if str(self.aria2_session_file) in [save_session, input_file]:
+                    print("aria2 RPC already running")
+                    return
+
+                print("aria2 RPC is running with old options")
+                print("Restarting aria2 RPC")
+                try:
+                    self.rpc("aria2.shutdown")
+                    time.sleep(2)
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+        if self.is_port_open():
+            subprocess.run(["pkill", "-9", "aria2c"], check=False)
+            time.sleep(2)
+
+        cmd = [
+            "aria2c",
+            "--enable-rpc=true",
+            "--rpc-listen-all=false",
+            "--rpc-listen-port=6800",
+            "--rpc-allow-origin-all=true",
+            "--daemon=true",
+            "--seed-time=0",
+            "--seed-ratio=0.0",
+            "--file-allocation=none",
+            "--continue=true",
+            "--always-resume=true",
+            "--auto-save-interval=10",
+            "--save-session-interval=10",
+            f"--input-file={self.aria2_session_file}",
+            f"--save-session={self.aria2_session_file}",
+            "--force-save=true",
+            "--max-tries=0",
+            "--retry-wait=10",
+            "--timeout=60",
+            "--connect-timeout=60",
+            "--enable-dht=true",
+            "--enable-dht6=true",
+            "--enable-peer-exchange=true",
+            "--bt-enable-lpd=true",
+            "--bt-save-metadata=true",
+            "--bt-load-saved-metadata=true",
+            "--console-log-level=warn"
+        ]
+
+        subprocess.run(cmd, check=True)
+
+        for _ in range(30):
+            if self.is_port_open():
+                print("aria2 RPC started")
+                print("aria2 session:", self.aria2_session_file)
+                return
+            time.sleep(0.5)
+
+        raise RuntimeError("Failed to start aria2 RPC server.")
+
+    def rpc(self, method, params=None):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "azudl-gc2gd",
+            "method": method,
+            "params": params or []
+        }
+
+        response = requests.post(self.rpc_url, json=payload, timeout=30)
+
+        if response.status_code != 200:
+            message = response.text[:1000]
+            raise RuntimeError(f"aria2 RPC HTTP {response.status_code}: {message}")
+
+        try:
+            data = response.json()
+        except Exception:
+            raise RuntimeError(f"Invalid aria2 RPC response: {response.text[:1000]}")
+
+        if "error" in data:
+            raise RuntimeError(data["error"])
+
+        return data["result"]
+
+    def save_aria2_session(self):
+        try:
+            result = self.rpc("aria2.saveSession")
+            print("aria2 session saved")
+            return result
+        except Exception as error:
+            message = str(error)
+
+            if "Filename is not given" in message:
+                return None
+
+            print("Failed to save aria2 session:", error)
+            return None
+
+    def sanitize_name(self, name):
+        name = str(name or "").strip()
+        name = re.sub(r'[\/\\:*?"<>|]', "_", name)
+        name = re.sub(r"\s+", " ", name)
+        return name or f"Download_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+
+    def format_bytes(self, value):
+        value = float(value or 0)
+
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if value < 1024:
+                return f"{value:.2f} {unit}"
+            value /= 1024
+
+        return f"{value:.2f} PB"
+
+    def format_seconds(self, seconds):
+        seconds = int(seconds or 0)
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        return f"{minutes:02d}:{secs:02d}"
+
+    def detect_link_type(self, value):
+        value = str(value or "").strip()
+        lower = value.lower()
+
+        if lower.startswith("magnet:?"):
+            return "torrent"
+
+        parsed = urlparse(value)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+
+        youtube_hosts = [
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+            "music.youtube.com"
+        ]
+
+        if any(host == item or host.endswith("." + item) for item in youtube_hosts):
+            return "youtube"
+
+        if path.endswith(".torrent"):
+            return "torrent_file"
+
+        if lower.startswith(("http://", "https://", "ftp://")):
+            return "direct"
+
+        if Path(value).suffix.lower() == ".torrent":
+            return "torrent_file"
+
+        return "unknown"
+
+    def save_history(self, item):
+        history = []
+
+        if self.history_file.exists():
+            try:
+                history = json.loads(self.history_file.read_text())
+            except Exception:
+                history = []
+
+        item["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        history.append(item)
+
+        self.history_file.write_text(json.dumps(history, indent=2, ensure_ascii=False))
+
+    def print_history(self):
+        if not self.history_file.exists():
+            print("No history found")
+            return
+
+        try:
+            history = json.loads(self.history_file.read_text())
+        except Exception:
+            print("History file is invalid")
+            return
+
+        if not history:
+            print("No history found")
+            return
+
+        for index, item in enumerate(history[-50:], 1):
+            print("-" * 80)
+            print("Index:", index)
+            print("Type:", item.get("type", "unknown"))
+            print("Time:", item.get("time", "unknown"))
+            print("Source:", item.get("source", "unknown"))
+            print("Output:", item.get("output", "unknown"))
+            print("Status:", item.get("status", "unknown"))
+
+            if item.get("format"):
+                print("Format:", item.get("format"))
+
+            if item.get("seed") is not None:
+                print("Seed:", item.get("seed"))
+
+            if item.get("error"):
+                print("Error:", item.get("error"))
+
+    def get_all_downloaded_files(self):
+        folders = [
+            self.torrent_dir,
+            self.youtube_dir,
+            self.direct_dir,
+            self.batch_dir,
+            self.github_dir,
+            self.archive_dir
+        ]
+
+        files = []
+
+        for folder in folders:
+            if folder.exists():
+                files.extend([item for item in folder.glob("**/*") if item.is_file()])
+
+        return sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
+
+    def get_latest_file(self):
+        files = self.get_all_downloaded_files()
+
+        if not files:
+            return None
+
+        return files[0]
+
+    def get_latest_downloaded_file(self):
+        return self.get_latest_file()
+
+    def get_latest_downloaded_folder(self):
+        folders = [
+            self.torrent_dir,
+            self.youtube_dir,
+            self.direct_dir,
+            self.batch_dir,
+            self.github_dir,
+            self.archive_dir
+        ]
+
+        all_dirs = []
+
+        for folder in folders:
+            if folder.exists():
+                all_dirs.extend([item for item in folder.glob("**/*") if item.is_dir()])
+
+        if not all_dirs:
+            return None
+
+        return max(all_dirs, key=lambda item: item.stat().st_mtime)
+
+    def list_downloads(self):
+        folders = [
+            self.torrent_dir,
+            self.youtube_dir,
+            self.direct_dir,
+            self.batch_dir,
+            self.github_dir,
+            self.archive_dir
+        ]
+
+        for folder in folders:
+            print("")
+            print(str(folder))
+            print("-" * 80)
+
+            if not folder.exists():
+                print("Folder does not exist")
+                continue
+
+            items = sorted(
+                folder.glob("**/*"),
+                key=lambda x: x.stat().st_mtime if x.exists() else 0,
+                reverse=True
+            )
+
+            files = [item for item in items if item.is_file()]
+
+            if not files:
+                print("No files")
+                continue
+
+            for item in files[:100]:
+                size = self.format_bytes(item.stat().st_size)
+                print(f"{size:<12} {item}")
+
+    def print_latest_file(self):
+        latest = self.get_latest_downloaded_file()
+
+        if not latest:
+            print("No files found")
+            return
+
+        print("Latest file")
+        print("-" * 80)
+        print("Path:", latest)
+        print("Size:", self.format_bytes(latest.stat().st_size))
+        print("Modified:", datetime.fromtimestamp(latest.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"))
+
+    def select_file(self):
+        files = self.get_all_downloaded_files()
+
+        if not files:
+            print("No files found")
+            return None
+
+        for index, item in enumerate(files[:100], 1):
+            print(f"{index:<4} {self.format_bytes(item.stat().st_size):<12} {item}")
+
+        value = input("File number: ").strip()
+
+        if not value.isdigit():
+            print("Invalid number")
+            return None
+
+        index = int(value)
+
+        if index < 1 or index > min(len(files), 100):
+            print("Invalid number")
+            return None
+
+        return files[index - 1]
+
+    def add_aria2_download(self, uris, save_dir, speed_limit="", extra_options=None):
+        options = {
+            "dir": str(save_dir),
+            "file-allocation": "none",
+            "continue": "true",
+            "always-resume": "true",
+            "max-tries": "0",
+            "retry-wait": "10",
+            "timeout": "60",
+            "connect-timeout": "60",
+            "allow-overwrite": "false",
+            "auto-file-renaming": "true",
+            "max-connection-per-server": "16",
+            "split": "16",
+            "min-split-size": "1M"
+        }
+
+        if speed_limit:
+            options["max-overall-download-limit"] = speed_limit.strip()
+
+        if extra_options:
+            options.update(extra_options)
+
+        gid = self.rpc("aria2.addUri", [uris, options])
+        self.save_aria2_session()
+        return gid
+
+    def add_aria2_torrent(self, torrent_bytes, save_dir, speed_limit="", extra_options=None):
+        torrent_base64 = base64.b64encode(torrent_bytes).decode("utf-8")
+
+        options = {
+            "dir": str(save_dir),
+            "file-allocation": "none",
+            "continue": "true",
+            "always-resume": "true",
+            "max-tries": "0",
+            "retry-wait": "10",
+            "timeout": "60",
+            "connect-timeout": "60",
+            "allow-overwrite": "false",
+            "auto-file-renaming": "true",
+            "seed-time": "0",
+            "seed-ratio": "0.0",
+            "enable-dht": "true",
+            "enable-dht6": "true",
+            "enable-peer-exchange": "true",
+            "bt-enable-lpd": "true"
+        }
+
+        if speed_limit:
+            options["max-overall-download-limit"] = speed_limit.strip()
+
+        if extra_options:
+            options.update(extra_options)
+
+        gid = self.rpc("aria2.addTorrent", [torrent_base64, [], options])
+        self.save_aria2_session()
+        return gid
+
+    def fetch_torrent_file_bytes(self, source):
+        source = source.strip()
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 AzuDl-GC2GD/1.3.0",
+            "Accept": "application/x-bittorrent,application/octet-stream,*/*"
+        }
+
+        if source.startswith(("http://", "https://")):
+            print("Downloading torrent file metadata")
+            response = requests.get(source, headers=headers, timeout=60, allow_redirects=True)
+            response.raise_for_status()
+            content = response.content
+        else:
+            path = Path(source)
+
+            if not path.exists():
+                raise FileNotFoundError(f"Torrent file not found: {path}")
+
+            content = path.read_bytes()
+
+        if not content:
+            raise ValueError("Torrent file is empty")
+
+        stripped = content.lstrip()
+
+        if not stripped.startswith(b"d"):
+            preview = content[:300].decode("utf-8", errors="replace")
+            raise ValueError(
+                "Downloaded file is not a valid .torrent file. "
+                "The server may have returned HTML, an error page, or blocked the request.\n"
+                f"Preview:\n{preview}"
+            )
+
+        return content
+
+    def skip_bencode_value(self, data, index):
+        token = data[index:index + 1]
+
+        if token == b"i":
+            end = data.index(b"e", index)
+            return end + 1
+
+        if token in [b"l", b"d"]:
+            index += 1
+
+            while data[index:index + 1] != b"e":
+                index = self.skip_bencode_value(data, index)
+
+            return index + 1
+
+        if token.isdigit():
+            colon = data.index(b":", index)
+            length = int(data[index:colon])
+            return colon + 1 + length
+
+        raise ValueError("Invalid bencode data")
+
+    def get_torrent_infohash(self, torrent_bytes):
+        data = torrent_bytes
+
+        if not data.startswith(b"d"):
+            return ""
+
+        index = 1
+
+        while index < len(data) and data[index:index + 1] != b"e":
+            key_start = index
+            key_end = self.skip_bencode_value(data, key_start)
+            key_data = data[key_start:key_end]
+
+            colon = key_data.index(b":")
+            key = key_data[colon + 1:]
+
+            value_start = key_end
+            value_end = self.skip_bencode_value(data, value_start)
+
+            if key == b"info":
+                return hashlib.sha1(data[value_start:value_end]).hexdigest()
+
+            index = value_end
+
+        return ""
+
+    def find_existing_torrent_by_infohash(self, infohash):
+        if not infohash:
+            return None
+
+        target = str(infohash).lower()
+        active, waiting, stopped = self.get_aria2_items()
+
+        for item in active + waiting + stopped:
+            bittorrent = item.get("bittorrent", {})
+            current = str(bittorrent.get("infoHash", "")).lower()
+
+            if current == target:
+                return item
+
+        return None
+
+    def remove_existing_torrent_gid(self, gid):
+        if not gid:
+            return False
+
+        try:
+            self.rpc("aria2.remove", [gid])
+            self.save_aria2_session()
+            return True
+        except Exception:
+            pass
+
+        try:
+            self.rpc("aria2.removeDownloadResult", [gid])
+            self.save_aria2_session()
+            return True
+        except Exception:
+            return False
+
+    def build_torrent_options(self, private=False, seed=False):
+        if seed:
+            seed_time = "525600"
+        else:
+            seed_time = "0"
+
+        if private:
+            return {
+                "seed-time": seed_time,
+                "seed-ratio": "0.0",
+                "enable-dht": "false",
+                "enable-dht6": "false",
+                "enable-peer-exchange": "false",
+                "bt-enable-lpd": "false",
+                "bt-save-metadata": "true",
+                "bt-load-saved-metadata": "true",
+                "bt-request-peer-speed-limit": "50K"
+            }
+
+        return {
+            "seed-time": seed_time,
+            "seed-ratio": "0.0",
+            "enable-dht": "true",
+            "enable-dht6": "true",
+            "enable-peer-exchange": "true",
+            "bt-enable-lpd": "true",
+            "bt-save-metadata": "true",
+            "bt-load-saved-metadata": "true",
+            "bt-request-peer-speed-limit": "50K"
+        }
+
+    def get_aria2_status(self, gid):
+        keys = [
+            "gid",
+            "status",
+            "totalLength",
+            "completedLength",
+            "downloadSpeed",
+            "uploadSpeed",
+            "uploadLength",
+            "connections",
+            "numSeeders",
+            "shareRatio",
+            "errorCode",
+            "errorMessage",
+            "files",
+            "bittorrent",
+            "followedBy",
+            "following",
+            "belongsTo"
+        ]
+
+        return self.rpc("aria2.tellStatus", [gid, keys])
+
+    def get_aria2_items(self):
+        keys = [
+            "gid",
+            "status",
+            "totalLength",
+            "completedLength",
+            "downloadSpeed",
+            "uploadSpeed",
+            "uploadLength",
+            "connections",
+            "numSeeders",
+            "shareRatio",
+            "errorCode",
+            "errorMessage",
+            "files",
+            "bittorrent",
+            "followedBy",
+            "following",
+            "belongsTo"
+        ]
+
+        active = self.rpc("aria2.tellActive", [keys])
+        waiting = self.rpc("aria2.tellWaiting", [0, 100, keys])
+        stopped = self.rpc("aria2.tellStopped", [0, 100, keys])
+
+        return active, waiting, stopped
+
+    def get_active_waiting_stopped(self):
+        return self.get_aria2_items()
+
+    def print_aria2_status(self):
+        active, waiting, stopped = self.get_aria2_items()
+
+        groups = [
+            ("Active", active),
+            ("Waiting", waiting),
+            ("Stopped", stopped)
+        ]
+
+        for title, items in groups:
+            print("")
+            print(title)
+            print("-" * 80)
+
+            if not items:
+                print("No items")
+                continue
+
+            for item in items:
+                gid = item.get("gid", "")
+                status = item.get("status", "")
+                total = int(item.get("totalLength", "0") or 0)
+                completed = int(item.get("completedLength", "0") or 0)
+                speed = int(item.get("downloadSpeed", "0") or 0)
+                upload_speed = int(item.get("uploadSpeed", "0") or 0)
+                uploaded = int(item.get("uploadLength", "0") or 0)
+                share_ratio = item.get("shareRatio", "0")
+                connections = item.get("connections", "0")
+                seeders = item.get("numSeeders", "0")
+                bittorrent = item.get("bittorrent", {})
+                infohash = bittorrent.get("infoHash", "")
+
+                percent = 0
+
+                if total > 0:
+                    percent = completed * 100 / total
+
+                files = item.get("files", [])
+                name = ""
+
+                if files:
+                    name = Path(files[0].get("path", "")).name
+
+                print("GID:", gid)
+                print("Status:", status)
+                print("Name:", name or "unknown")
+                print("InfoHash:", infohash or "unknown")
+                print("Progress:", f"{percent:.2f}%")
+                print("Completed:", self.format_bytes(completed), "/", self.format_bytes(total))
+                print("Download Speed:", self.format_bytes(speed) + "/s")
+                print("Upload Speed:", self.format_bytes(upload_speed) + "/s")
+                print("Uploaded:", self.format_bytes(uploaded))
+                print("Ratio:", share_ratio)
+                print("Connections:", connections)
+                print("Seeders:", seeders)
+
+                if item.get("errorMessage"):
+                    print("Error:", item.get("errorMessage"))
+
+                print("-" * 80)
+
+    def purge_aria2_stopped(self):
+        try:
+            result = self.rpc("aria2.purgeDownloadResult")
+            self.save_aria2_session()
+            print("Stopped download results cleared")
+            print(result)
+        except Exception as error:
+            print("Failed to purge stopped downloads:", error)
+
+    def remove_aria2_gid(self):
+        gid = input("GID to remove: ").strip()
+
+        if not gid:
+            print("No GID entered")
+            return
+
+        removed = self.remove_existing_torrent_gid(gid)
+
+        if removed:
+            print("GID removed:", gid)
+        else:
+            print("Failed to remove GID:", gid)
+
+    def find_real_torrent_gid(self, metadata_gid, save_dir):
+        save_dir = str(save_dir)
+
+        for _ in range(120):
+            try:
+                status = self.get_aria2_status(metadata_gid)
+            except Exception:
+                status = {}
+
+            followed_by = status.get("followedBy", [])
+
+            if followed_by:
+                real_gid = followed_by[0]
+                print("Metadata completed")
+                print("Real torrent GID:", real_gid)
+                return real_gid
+
+            active, waiting, stopped = self.get_active_waiting_stopped()
+            candidates = active + waiting + stopped
+
+            for item in candidates:
+                gid = item.get("gid")
+
+                if gid == metadata_gid:
+                    continue
+
+                belongs_to = item.get("belongsTo")
+                following = item.get("following")
+
+                if belongs_to == metadata_gid or following == metadata_gid:
+                    print("Real torrent GID:", gid)
+                    return gid
+
+                files = item.get("files", [])
+
+                for file_item in files:
+                    path = file_item.get("path", "")
+
+                    if path and str(path).startswith(save_dir):
+                        total = int(item.get("totalLength", "0") or 0)
+
+                        if total > 0:
+                            print("Real torrent GID:", gid)
+                            return gid
+
+            state = status.get("status")
+
+            if state == "error":
+                raise RuntimeError(status.get("errorMessage") or "Metadata failed.")
+
+            time.sleep(1)
+
+        print("Could not detect a separate real torrent GID")
+        print("Using original GID")
+        return metadata_gid
+
+    def wait_for_torrent_metadata(self, gid):
+        bar = tqdm(total=1, desc="Fetching metadata", unit="step")
+
+        while True:
+            status = self.get_aria2_status(gid)
+
+            if status.get("status") == "error":
+                bar.close()
+                self.save_aria2_session()
+                raise RuntimeError(status.get("errorMessage") or "Metadata fetch failed.")
+
+            followed_by = status.get("followedBy", [])
+            files = status.get("files", [])
+            total = int(status.get("totalLength", "0") or 0)
+
+            if followed_by:
+                bar.update(1)
+                bar.close()
+                self.save_aria2_session()
+                return
+
+            if files and total > 0:
+                bittorrent = status.get("bittorrent", {})
+                info = bittorrent.get("info", {})
+
+                if info:
+                    bar.update(1)
+                    bar.close()
+                    self.save_aria2_session()
+                    return
+
+            if status.get("status") == "complete" and files and total > 0:
+                bar.update(1)
+                bar.close()
+                self.save_aria2_session()
+                return
+
+            time.sleep(1)
+
+    def monitor_aria2(self, gid, label, seed=False):
+        last_completed = 0
+        progress = None
+        last_state = None
+        printed_file = None
+        seeding_notice_printed = False
+        seed_started_at = None
+        seed_bar = None
+        last_session_save = time.time()
+
+        while True:
+            status = self.get_aria2_status(gid)
+
+            state = status.get("status")
+            total = int(status.get("totalLength", "0") or 0)
+            completed = int(status.get("completedLength", "0") or 0)
+            speed = int(status.get("downloadSpeed", "0") or 0)
+            upload_speed = int(status.get("uploadSpeed", "0") or 0)
+            uploaded = int(status.get("uploadLength", "0") or 0)
+            seeders = status.get("numSeeders", "0")
+            connections = status.get("connections", "0")
+            share_ratio = status.get("shareRatio", "0")
+            files = status.get("files", [])
+
+            if time.time() - last_session_save >= 30:
+                self.save_aria2_session()
+                last_session_save = time.time()
+
+            if state != last_state:
+                print("Status:", state)
+                last_state = state
+
+            if files:
+                first_file = files[0].get("path", "")
+                if first_file and first_file != printed_file:
+                    print("File:", Path(first_file).name)
+                    printed_file = first_file
+
+            if state == "error":
+                if progress is not None:
+                    progress.close()
+                if seed_bar is not None:
+                    seed_bar.close()
+                self.save_aria2_session()
+                raise RuntimeError(status.get("errorMessage") or "Download failed.")
+
+            if progress is None and total > 0 and not (seed and completed >= total):
+                progress = tqdm(
+                    total=total,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=label
+                )
+
+            if progress is not None:
+                if completed < last_completed:
+                    last_completed = 0
+                    progress.n = 0
+
+                delta = completed - last_completed
+
+                if delta > 0:
+                    progress.update(delta)
+
+                percent = 0
+
+                if total > 0:
+                    percent = completed * 100 / total
+
+                postfix = {
+                    "percent": f"{percent:.2f}%",
+                    "down": self.format_bytes(speed) + "/s",
+                    "up": self.format_bytes(upload_speed) + "/s",
+                    "uploaded": self.format_bytes(uploaded),
+                    "ratio": str(share_ratio),
+                    "connections": connections
+                }
+
+                if str(seeders) != "0":
+                    postfix["seeders"] = seeders
+
+                progress.set_postfix(postfix)
+
+            last_completed = completed
+
+            if seed and total > 0 and completed >= total:
+                if seed_started_at is None:
+                    seed_started_at = time.time()
+
+                if not seeding_notice_printed:
+                    print("Download completed")
+                    print("Seeding is enabled")
+                    print("Keep this Colab runtime alive to continue seeding")
+                    print("Press interrupt if you want to stop seeding")
+                    seeding_notice_printed = True
+
+                    if progress is not None:
+                        progress.n = total
+                        progress.refresh()
+                        progress.close()
+                        progress = None
+
+                    seed_bar = tqdm(
+                        total=1,
+                        unit="step",
+                        desc="Seeding Upload"
+                    )
+
+                    self.save_aria2_session()
+
+                if seed_bar is not None:
+                    elapsed = self.format_seconds(time.time() - seed_started_at)
+
+                    seed_bar.n = 0
+                    seed_bar.set_postfix({
+                        "up": self.format_bytes(upload_speed) + "/s",
+                        "uploaded": self.format_bytes(uploaded),
+                        "ratio": str(share_ratio),
+                        "connections": connections,
+                        "seeders": seeders,
+                        "time": elapsed
+                    })
+                    seed_bar.refresh()
+
+            if state == "complete" and not seed:
+                if progress is not None:
+                    progress.n = total
+                    progress.refresh()
+                    progress.close()
+                self.save_aria2_session()
+                return status
+
+            if state == "complete" and seed:
+                time.sleep(5)
+                continue
+
+            time.sleep(1)
+
+    def download_magnet(self, magnet, folder_name="", speed_limit="", private=False, seed=False):
+        magnet = magnet.strip()
+        folder_name = self.sanitize_name(folder_name)
+        save_dir = self.torrent_dir / folder_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        if not magnet.startswith("magnet:?xt=urn:btih:"):
+            raise ValueError("Invalid magnet link.")
+
+        options = self.build_torrent_options(
+            private=private,
+            seed=seed
+        )
+
+        gid = self.add_aria2_download([magnet], save_dir, speed_limit, options)
+
+        print("Magnet added")
+        print("Output:", save_dir)
+        print("Metadata GID:", gid)
+        print("Private mode:", "enabled" if private else "disabled")
+        print("Seeding:", "enabled" if seed else "disabled")
+
+        self.wait_for_torrent_metadata(gid)
+
+        real_gid = self.find_real_torrent_gid(gid, save_dir)
+
+        print("Starting torrent download monitor")
+        print("Download GID:", real_gid)
+
+        status = self.monitor_aria2(real_gid, "Torrent Download", seed=seed)
+
+        if not seed:
+            self.verify_aria2_status_files(status, label="Torrent magnet download")
+
+        self.save_history({
+            "type": "private_torrent_magnet" if private else "torrent",
+            "source": magnet,
+            "output": str(save_dir),
+            "status": "completed",
+            "seed": seed
+        })
+
+        print("Download completed")
+        print("Saved to:", save_dir)
+
+    def download_torrent_file(self, source, folder_name="", speed_limit="", private=False, seed=False):
+        source = source.strip()
+        folder_name = self.sanitize_name(folder_name)
+        save_dir = self.torrent_dir / folder_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        torrent_bytes = self.fetch_torrent_file_bytes(source)
+        infohash = self.get_torrent_infohash(torrent_bytes)
+
+        if infohash:
+            print("Torrent InfoHash:", infohash)
+
+            existing = self.find_existing_torrent_by_infohash(infohash)
+
+            if existing:
+                existing_gid = existing.get("gid")
+                existing_status = existing.get("status", "unknown")
+
+                print("This torrent is already registered in aria2")
+                print("Existing GID:", existing_gid)
+                print("Existing status:", existing_status)
+
+                if existing_status == "error":
+                    print("Existing torrent is in error state")
+                    print("Removing old GID and adding again")
+                    removed = self.remove_existing_torrent_gid(existing_gid)
+
+                    if not removed:
+                        raise RuntimeError("Could not remove existing errored torrent GID")
+
+                else:
+                    print("Using existing torrent instead of adding duplicate")
+                    self.monitor_aria2(existing_gid, "Torrent Resume", seed=seed)
+
+                    self.save_history({
+                        "type": "private_torrent_file_resume" if private else "torrent_file_resume",
+                        "source": source,
+                        "output": str(save_dir),
+                        "status": "resumed",
+                        "seed": seed
+                    })
+
+                    print("Torrent handled with existing GID")
+                    return
+
+        options = self.build_torrent_options(
+            private=private,
+            seed=seed
+        )
+
+        try:
+            gid = self.add_aria2_torrent(torrent_bytes, save_dir, speed_limit, options)
+        except Exception as error:
+            message = str(error)
+
+            if "already registered" in message:
+                print("This torrent is already registered in aria2.")
+                print("Open Torrent Tools > aria2 status, remove the existing GID, then try again.")
+                raise RuntimeError(message)
+
+            debug_file = self.logs_dir / f"failed_torrent_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.torrent"
+            debug_file.write_bytes(torrent_bytes)
+
+            print("Failed to pass torrent data to aria2")
+            print("Saved downloaded .torrent for debugging:")
+            print(debug_file)
+
+            raise error
+
+        print("Torrent file added")
+        print("Output:", save_dir)
+        print("Download GID:", gid)
+        print("Private mode:", "enabled" if private else "disabled")
+        print("Seeding:", "enabled" if seed else "disabled")
+
+        try:
+            status = self.monitor_aria2(gid, "Torrent File Download", seed=seed)
+
+            if not seed:
+                self.verify_aria2_status_files(status, label="Torrent file download")
+        except Exception as error:
+            message = str(error)
+
+            if "already registered" in message:
+                print("Duplicate torrent detected after adding")
+                print("Removing duplicate GID:", gid)
+                self.remove_existing_torrent_gid(gid)
+                raise RuntimeError("Torrent already exists in aria2. Removed duplicate GID. Try again or use aria2 status.")
+
+            raise error
+
+        self.save_history({
+            "type": "private_torrent_file" if private else "torrent_file",
+            "source": source,
+            "output": str(save_dir),
+            "status": "completed",
+            "seed": seed
+        })
+
+        print("Download completed")
+        print("Saved to:", save_dir)
+
+    def download_private_torrent(self):
+        print("Private Torrent")
+        print("-" * 80)
+        print("Recommended: use a .torrent file from your private tracker.")
+        print("Private mode disables DHT, DHT6, PEX, and LPD.")
+        print("Seeding works only while the Colab runtime is alive.")
+        print("For long-term seeding, use a seedbox or VPS.")
+        print("-" * 80)
+
+        source = input("Private .torrent URL, local path, or magnet: ").strip()
+        folder_name = input("Folder name optional: ").strip()
+        speed_limit = input("Speed limit optional, example 5M: ").strip()
+        seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+        seed = seed_answer == "y"
+
+        if not source:
+            print("No torrent source entered")
+            return
+
+        if source.startswith("magnet:?"):
+            print("Warning: magnet links are not recommended for private torrents.")
+            print("A .torrent file is strongly recommended for private trackers.")
+            self.download_magnet(
+                magnet=source,
+                folder_name=folder_name,
+                speed_limit=speed_limit,
+                private=True,
+                seed=seed
+            )
+            return
+
+        self.download_torrent_file(
+            source=source,
+            folder_name=folder_name,
+            speed_limit=speed_limit,
+            private=True,
+            seed=seed
+        )
+
+    def torrent_menu(self):
+        while True:
+            print("")
+            print("=" * 70)
+            print("Torrent Tools")
+            print("=" * 70)
+            print("1. Torrent magnet")
+            print("2. Torrent file")
+            print("3. Private torrent")
+            print("4. aria2 status")
+            print("5. Remove aria2 GID")
+            print("6. Clear stopped aria2 results")
+            print("7. Save aria2 session")
+            print("8. Back")
+
+            choice = input("Select torrent option: ").strip()
+
+            try:
+                if choice == "1":
+                    magnet = input("Magnet link: ").strip()
+                    folder_name = input("Folder name optional: ").strip()
+                    speed_limit = input("Speed limit optional, example 5M: ").strip()
+                    seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+                    seed = seed_answer == "y"
+
+                    self.download_magnet(
+                        magnet=magnet,
+                        folder_name=folder_name,
+                        speed_limit=speed_limit,
+                        private=False,
+                        seed=seed
+                    )
+
+                elif choice == "2":
+                    source = input("Torrent file URL or path: ").strip()
+                    folder_name = input("Folder name optional: ").strip()
+                    speed_limit = input("Speed limit optional, example 5M: ").strip()
+                    seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+                    seed = seed_answer == "y"
+
+                    self.download_torrent_file(
+                        source=source,
+                        folder_name=folder_name,
+                        speed_limit=speed_limit,
+                        private=False,
+                        seed=seed
+                    )
+
+                elif choice == "3":
+                    self.download_private_torrent()
+
+                elif choice == "4":
+                    self.print_aria2_status()
+
+                elif choice == "5":
+                    self.remove_aria2_gid()
+
+                elif choice == "6":
+                    self.purge_aria2_stopped()
+
+                elif choice == "7":
+                    self.save_aria2_session()
+
+                elif choice == "8":
+                    break
+
+                else:
+                    print("Invalid torrent option")
+
+            except KeyboardInterrupt:
+                self.save_aria2_session()
+                print("Cancelled")
+
+            except Exception as error:
+                self.save_aria2_session()
+                print("Error:", error)
+
+    def parse_headers_json(self, text):
+        text = str(text or "").strip()
+
+        if not text:
+            return None
+
+        try:
+            data = json.loads(text)
+        except Exception:
+            print("Invalid headers JSON, ignored")
+            return None
+
+        if not isinstance(data, dict):
+            print("Headers JSON must be an object, ignored")
+            return None
+
+        return data
+
+    def download_direct(self, url, folder_name="", file_name="", speed_limit="", headers=None):
+        url = url.strip()
+        folder_name = self.sanitize_name(folder_name)
+        file_name = file_name.strip()
+        save_dir = self.direct_dir / folder_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        if not url.startswith(("http://", "https://", "ftp://")):
+            raise ValueError("Invalid direct link.")
+
+        options = {}
+
+        if file_name:
+            options["out"] = self.sanitize_name(file_name)
+
+        if headers:
+            header_lines = []
+
+            for key, value in headers.items():
+                if key and value:
+                    header_lines.append(f"{key}: {value}")
+
+            if header_lines:
+                options["header"] = header_lines
+
+        gid = self.add_aria2_download([url], save_dir, speed_limit, options)
+
+        print("Direct download added")
+        print("Output:", save_dir)
+
+        status = self.monitor_aria2(gid, "Direct")
+        self.verify_aria2_status_files(status, label="Direct download")
+
+        self.save_history({
+            "type": "direct",
+            "source": url,
+            "output": str(save_dir),
+            "status": "completed"
+        })
+
+        print("Download completed")
+        print("Saved to:", save_dir)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # YouTube
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def get_youtube_available_qualities(self, url):
+        """
+        Fetch video info once and return only the quality levels that actually
+        exist as video streams, plus always "best" as first option.
+        Returns (qualities_list, info_dict).
+        """
+        with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        formats = info.get("formats", [])
+        standard_heights = [4320, 2160, 1440, 1080, 720, 480, 360, 240, 144]
+
+        available_heights = set()
+        for f in formats:
+            h = f.get("height")
+            vcodec = f.get("vcodec", "none")
+            if h and vcodec and vcodec != "none":
+                available_heights.add(int(h))
+
+        qualities = ["best"]
+        for h in standard_heights:
+            if h in available_heights:
+                qualities.append(str(h))
+
+        return qualities, info
+
+    def select_youtube_quality(self, url):
+        """
+        Fetch video info, ask audio/video preference, then show only the
+        quality options the video actually has.
+        Returns (quality_string, audio_only_bool).
+        """
+        print("Fetching video info...")
+
+        try:
+            qualities, info = self.get_youtube_available_qualities(url)
+        except Exception as error:
+            print("Could not fetch video info:", error)
+            print("Falling back to best quality")
+            return "best", False
+
+        title = info.get("title", "")
+        duration = info.get("duration", 0)
+        uploader = info.get("uploader", "")
+
+        print("-" * 60)
+        if title:
+            print("Title   :", title)
+        if uploader:
+            print("Channel :", uploader)
+        if duration:
+            print("Duration:", self.format_seconds(int(duration)))
+        print("-" * 60)
+
+        audio_answer = input("Audio only? y/n: ").strip().lower()
+        if audio_answer == "y":
+            return "best", True
+
+        print("Available qualities:")
+        for i, q in enumerate(qualities, 1):
+            label = "Best available" if q == "best" else f"{q}p"
+            print(f"  {i}. {label}")
+
+        choice = input(f"Select quality (1-{len(qualities)}, default 1): ").strip()
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(qualities):
+                selected = qualities[idx]
+                label = "Best available" if selected == "best" else f"{selected}p"
+                print("Selected:", label)
+                return selected, False
+
+        print("Invalid selection, using best quality")
+        return "best", False
+
+    def build_youtube_format(self, quality, audio_only):
+        """
+        Build a yt-dlp format string.
+        For video downloads, audio is always merged — no silent video possible.
+        """
+        quality = str(quality or "best").strip().lower()
+
+        if audio_only:
+            return "bestaudio/best"
+
+        if quality == "best":
+            return "bv*[vcodec!=none]+ba/bestvideo+bestaudio/best"
+
+        if quality in ["4320", "2160", "1440", "1080", "720", "480", "360", "240", "144"]:
+            return (
+                f"bestvideo[height={quality}][vcodec!=none]+bestaudio/"
+                f"bestvideo[height<={quality}][vcodec!=none]+bestaudio/"
+                f"best[height<={quality}]/best"
+            )
+
+        return "bv*[vcodec!=none]+ba/bestvideo+bestaudio/best"
+
+    def get_youtube_cookie_file(self):
+        env_file = os.environ.get("AZUDL_YOUTUBE_COOKIES", "").strip()
+
+        if env_file and Path(env_file).exists():
+            return Path(env_file)
+
+        candidates = [
+            Path("/content/cookies.txt"),
+            Path("/content/youtube_cookies.txt"),
+            self.youtube_cookies_file,
+            self.base_dir / "youtube_cookies.txt",
+            self.base_dir / "cookies.txt"
+        ]
+
+        for item in candidates:
+            if item.exists():
+                text = item.read_text(errors="ignore")
+
+                if "youtube.com" in text or "\t" in text:
+                    return item
+
+        return None
+
+    def get_youtube_po_token(self):
+        return os.environ.get("AZUDL_YOUTUBE_PO_TOKEN", "").strip() or self.read_first_useful_line(self.youtube_po_token_file)
+
+    def get_youtube_visitor_data(self):
+        return os.environ.get("AZUDL_YOUTUBE_VISITOR_DATA", "").strip() or self.read_first_useful_line(self.youtube_visitor_data_file)
+
+    def get_youtube_player_client(self):
+        return os.environ.get("AZUDL_YOUTUBE_PLAYER_CLIENT", "").strip() or "mweb"
+
+    def get_youtube_extractor_args(self):
+        po_token = self.get_youtube_po_token()
+        visitor_data = self.get_youtube_visitor_data()
+        player_client = self.get_youtube_player_client()
+        args = {}
+
+        if po_token:
+            args["youtube"] = {"po_token": [po_token]}
+
+        if visitor_data:
+            args.setdefault("youtube", {})
+            args["youtube"]["visitor_data"] = [visitor_data]
+
+        if player_client:
+            args.setdefault("youtube", {})
+            args["youtube"]["player_client"] = [player_client]
+
+        return args
+
+    def print_youtube_auth_status(self):
+        self.print_section("YouTube Authentication Status")
+        cookie_file = self.get_youtube_cookie_file()
+        self.print_kv("Cookies file", cookie_file or "not configured")
+        self.print_kv("PO Token", "configured" if self.get_youtube_po_token() else "not configured")
+        self.print_kv("Visitor Data", "configured" if self.get_youtube_visitor_data() else "not configured")
+        self.print_kv("Player client", self.get_youtube_player_client())
+
+    def save_youtube_cookies_interactive(self):
+        print("Paste Netscape-format cookies.txt content.")
+        print("Submit an empty line to finish.")
+        lines = []
+
+        while True:
+            line = input()
+
+            if not line:
+                break
+
+            lines.append(line)
+
+        if not lines:
+            print("No cookies entered")
+            return
+
+        self.youtube_cookies_file.write_text("\n".join(lines) + "\n")
+        print("Saved:", self.youtube_cookies_file)
+
+    def save_youtube_po_token_interactive(self):
+        po_token = input("PO Token, example mweb+TOKEN: ").strip()
+        visitor_data = input("Visitor Data optional: ").strip()
+
+        if po_token:
+            self.youtube_po_token_file.write_text(po_token + "\n")
+            print("Saved:", self.youtube_po_token_file)
+
+        if visitor_data:
+            self.youtube_visitor_data_file.write_text(visitor_data + "\n")
+            print("Saved:", self.youtube_visitor_data_file)
+
+    def print_youtube_auth_help(self):
+        self.print_section("YouTube Auth Help")
+        print("Some YouTube downloads in Colab may require cookies or PO Token.")
+        print("Cookies file:", self.youtube_cookies_file)
+        print("PO Token file:", self.youtube_po_token_file)
+        print("Visitor Data file:", self.youtube_visitor_data_file)
+        print("Keep real cookies and tokens private. Never commit them to GitHub.")
+
+    def download_youtube(self, url, folder_name="", quality="best", audio_only=False, playlist=True, metadata=False):
+        url = url.strip()
+
+        if not url:
+            raise ValueError("YouTube URL is required.")
+
+        folder_name = self.sanitize_name(folder_name or "YouTube")
+        save_dir = self.youtube_dir / folder_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + hashlib.sha1(url.encode()).hexdigest()[:8]
+        work_dir = self.temp_dir / "YouTube" / run_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        progress_state = {"bar": None, "last": 0}
+
+        def hook(data):
+            if data.get("status") == "downloading":
+                total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                downloaded = data.get("downloaded_bytes") or 0
+                speed = data.get("speed") or 0
+
+                if total and progress_state["bar"] is None:
+                    progress_state["bar"] = tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, desc="YouTube")
+
+                if progress_state["bar"]:
+                    if downloaded < progress_state["last"]:
+                        progress_state["bar"].n = 0
+                        progress_state["last"] = 0
+
+                    delta = downloaded - progress_state["last"]
+
+                    if delta > 0:
+                        progress_state["bar"].update(delta)
+
+                    progress_state["bar"].set_postfix({"speed": self.format_bytes(speed) + "/s"})
+
+                progress_state["last"] = downloaded
+
+            elif data.get("status") == "finished":
+                if progress_state["bar"]:
+                    progress_state["bar"].close()
+                    progress_state["bar"] = None
+
+                progress_state["last"] = 0
+                print("Processing media")
+
+        selected_format = self.build_youtube_format(quality, audio_only)
+
+        if audio_only:
+            postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"}]
+        else:
+            postprocessors = [{"key": "FFmpegMetadata"}]
+
+        options = {
+            "format": selected_format,
+            "outtmpl": str(work_dir / "%(playlist_index|)s%(playlist_index& - |)s%(title).200s.%(ext)s"),
+            "merge_output_format": "mp4",
+            "paths": {"home": str(work_dir), "temp": str(work_dir)},
+            "noplaylist": not playlist,
+            "ignoreerrors": bool(playlist),
+            "continuedl": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "concurrent_fragment_downloads": 4,
+            "progress_hooks": [hook],
+            "postprocessors": postprocessors,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "writeinfojson": metadata,
+            "writethumbnail": metadata,
+            "windowsfilenames": True
+        }
+
+        cookie_file = self.get_youtube_cookie_file()
+
+        if cookie_file:
+            options["cookiefile"] = str(cookie_file)
+            print("Using YouTube cookies:", cookie_file)
+
+        extractor_args = self.get_youtube_extractor_args()
+
+        if extractor_args:
+            options["extractor_args"] = extractor_args
+            print("Using YouTube extractor args")
+
+        print("YouTube download started")
+        print("Format:", selected_format)
+        print("Output:", save_dir)
+        print("Temporary:", work_dir)
+
+        try:
+            with YoutubeDL(options) as ydl:
+                result = ydl.download([url])
+
+            if result not in [0, None]:
+                raise RuntimeError(f"yt-dlp returned a non-zero result: {result}")
+
+            local_files = self.collect_final_files(work_dir)
+
+            if not local_files:
+                raise RuntimeError(f"YouTube download finished, but no final media file was produced in: {work_dir}")
+
+            transferred_files = self.transfer_folder_contents_to_drive(work_dir, save_dir)
+
+            if not transferred_files:
+                raise RuntimeError("No files were transferred to Google Drive.")
+
+            self.verify_output_files(save_dir, label="YouTube download")
+
+        except Exception as error:
+            if "Sign in to confirm" in str(error) or "not a bot" in str(error) or "cookies" in str(error).lower():
+                self.print_youtube_auth_help()
+
+            self.save_history({"type": "youtube", "source": url, "output": str(save_dir), "format": selected_format, "status": "failed", "error": str(error)})
+            raise error
+
+        self.save_history({"type": "youtube", "source": url, "output": str(save_dir), "format": selected_format, "status": "completed", "files": [str(item) for item in transferred_files]})
+
+        print("Download completed, transferred, and verified on Google Drive")
+        print("Saved to:", save_dir)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def auto_download(self, value):
+        link_type = self.detect_link_type(value)
+
+        if link_type == "unknown":
+            raise ValueError("Unknown link type.")
+
+        print("Detected:", link_type)
+
+        folder_name = input("Folder name optional: ").strip()
+
+        if link_type == "torrent":
+            speed_limit = input("Speed limit optional, example 5M: ").strip()
+            seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+            seed = seed_answer == "y"
+
+            self.download_magnet(
+                value,
+                folder_name,
+                speed_limit,
+                private=False,
+                seed=seed
+            )
+
+        elif link_type == "torrent_file":
+            speed_limit = input("Speed limit optional, example 5M: ").strip()
+            seed_answer = input("Keep seeding after download? y/n: ").strip().lower()
+            seed = seed_answer == "y"
+
+            self.download_torrent_file(
+                value,
+                folder_name,
+                speed_limit,
+                private=False,
+                seed=seed
+            )
+
+        elif link_type == "youtube":
+            quality, audio_only = self.select_youtube_quality(value)
+            playlist_answer = input("Download playlist if detected? y/n: ").strip().lower()
+            playlist = playlist_answer != "n"
+            metadata_answer = input("Save YouTube metadata and thumbnail? y/n: ").strip().lower()
+            metadata = metadata_answer == "y"
+
+            self.download_youtube(
+                url=value,
+                folder_name=folder_name,
+                quality=quality,
+                audio_only=audio_only,
+                playlist=playlist,
+                metadata=metadata
+            )
+
+        elif link_type == "direct":
+            file_name = input("File name optional: ").strip()
+            speed_limit = input("Speed limit optional, example 5M: ").strip()
+            headers_text = input('Headers JSON optional, example {"User-Agent":"Mozilla/5.0"}: ').strip()
+            headers = self.parse_headers_json(headers_text)
+            self.download_direct(value, folder_name, file_name, speed_limit, headers)
+
+    def batch_download(self):
+        print("Enter links one by one")
+        print("Submit an empty line to start")
+
+        links = []
+
+        while True:
+            value = input("Link: ").strip()
+
+            if not value:
+                break
+
+            links.append(value)
+
+        if not links:
+            print("No links entered")
+            return
+
+        folder_name = input("Batch folder name optional: ").strip()
+        folder_name = self.sanitize_name(folder_name)
+        speed_limit = input("Speed limit for direct and torrent optional, example 5M: ").strip()
+
+        for index, link in enumerate(links, 1):
+            print("")
+            print("=" * 80)
+            print("Item:", index, "of", len(links))
+            print("Link:", link)
+
+            link_type = self.detect_link_type(link)
+            batch_folder = f"{folder_name}_{index}"
+
+            try:
+                if link_type == "torrent":
+                    self.download_magnet(link, batch_folder, speed_limit, private=False, seed=False)
+
+                elif link_type == "torrent_file":
+                    self.download_torrent_file(link, batch_folder, speed_limit, private=False, seed=False)
+
+                elif link_type == "youtube":
+                    self.download_youtube(
+                        url=link,
+                        folder_name=batch_folder,
+                        quality="best",
+                        audio_only=False,
+                        playlist=True,
+                        metadata=False
+                    )
+
+                elif link_type == "direct":
+                    self.download_direct(link, batch_folder, "", speed_limit)
+
+                else:
+                    print("Skipped unknown link")
+
+            except Exception as error:
+                print("Failed:", error)
+
+                self.save_history({
+                    "type": link_type,
+                    "source": link,
+                    "output": batch_folder,
+                    "status": "failed",
+                    "error": str(error)
+                })
+
+    def parse_github_repo(self, value):
+        value = str(value or "").strip()
+
+        if not value:
+            raise ValueError("GitHub repository URL is required.")
+
+        if value.startswith("git@github.com:"):
+            value = value.replace("git@github.com:", "https://github.com/", 1)
+
+        if value.endswith(".git"):
+            value = value[:-4]
+
+        parsed = urlparse(value)
+
+        if parsed.netloc.lower() not in ["github.com", "www.github.com"]:
+            raise ValueError("Only github.com repository URLs are supported.")
+
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+
+        if len(parts) < 2:
+            raise ValueError("Invalid GitHub repository URL. Expected https://github.com/owner/repo")
+
+        owner = re.sub(r"[^A-Za-z0-9_.-]", "", parts[0])
+        repo = re.sub(r"[^A-Za-z0-9_.-]", "", parts[1])
+
+        return owner, repo
+
+    def get_github_token(self):
+        env_token = os.environ.get("AZUDL_GITHUB_TOKEN", "").strip()
+
+        if env_token:
+            return env_token
+
+        return self.read_first_useful_line(self.github_token_file)
+
+    def save_github_token_interactive(self):
+        token = input("GitHub token optional: ").strip()
+
+        if not token:
+            print("No token entered")
+            return
+
+        self.github_token_file.write_text(token + "\n")
+        os.environ["AZUDL_GITHUB_TOKEN"] = token
+        print("GitHub token saved:", self.github_token_file)
+
+    def clear_github_token(self):
+        if self.github_token_file.exists():
+            self.github_token_file.unlink()
+
+        os.environ.pop("AZUDL_GITHUB_TOKEN", None)
+        self.ensure_text_template(self.github_token_file, "# Optional GitHub token\n")
+        print("GitHub token cleared")
+
+    def github_headers(self):
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "AzuDl-GC2GD"}
+        token = self.get_github_token()
+
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        return headers
+
+    def github_api_get(self, url):
+        response = requests.get(url, headers=self.github_headers(), timeout=60, allow_redirects=True)
+
+        if response.status_code == 404:
+            raise RuntimeError("GitHub resource was not found or is private.")
+
+        if response.status_code == 403:
+            raise RuntimeError("GitHub API rate limit or access restriction. Set GitHub token if needed.")
+
+        response.raise_for_status()
+        return response.json()
+
+    def get_github_rate_limit(self):
+        response = requests.get("https://api.github.com/rate_limit", headers=self.github_headers(), timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def print_github_auth_status(self):
+        self.print_section("GitHub Authentication")
+        token = self.get_github_token()
+        self.print_kv("Token", "configured" if token else "not configured")
+        self.print_kv("Token file", self.github_token_file)
+
+        try:
+            data = self.get_github_rate_limit()
+            core = data.get("resources", {}).get("core", {})
+            self.print_kv("Rate limit", core.get("limit", "unknown"))
+            self.print_kv("Remaining", core.get("remaining", "unknown"))
+            reset = core.get("reset")
+
+            if reset:
+                self.print_kv("Reset", datetime.fromtimestamp(int(reset)).strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as error:
+            self.print_status(f"Could not read GitHub rate limit: {error}", "warning")
+
+    def get_github_repo_info(self, repo_url):
+        owner, repo = self.parse_github_repo(repo_url)
+        repo_info = self.github_api_get(f"https://api.github.com/repos/{owner}/{repo}")
+
+        try:
+            releases = self.github_api_get(f"https://api.github.com/repos/{owner}/{repo}/releases")
+        except Exception:
+            releases = []
+
+        return owner, repo, repo_info, releases
+
+    def print_github_repo_info(self, repo_url):
+        owner, repo, repo_info, releases = self.get_github_repo_info(repo_url)
+
+        self.print_section("GitHub Repository")
+        self.print_kv("Repository", f"{owner}/{repo}")
+        self.print_kv("Name", repo_info.get("name", "unknown"))
+        self.print_kv("Description", repo_info.get("description") or "none")
+        self.print_kv("Default branch", repo_info.get("default_branch", "unknown"))
+        self.print_kv("Stars", repo_info.get("stargazers_count", 0))
+        self.print_kv("Forks", repo_info.get("forks_count", 0))
+        self.print_kv("Open issues", repo_info.get("open_issues_count", 0))
+        self.print_kv("Latest release", releases[0].get("tag_name", "none") if releases else "none")
+        self.print_kv("Release count", len(releases))
+
+        if releases:
+            self.print_subsection("Recent Releases")
+            for item in releases[:10]:
+                tag = item.get("tag_name", "unknown")
+                name = item.get("name") or tag
+                assets = item.get("assets", [])
+                published = item.get("published_at", "unknown")
+                print(f"{tag:<24} {published:<24} {len(assets)} asset(s)  {name}")
+
+    def get_github_release_by_tag(self, owner, repo, tag):
+        tag = str(tag or "").strip()
+
+        if not tag:
+            return None
+
+        return self.github_api_get(f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}")
+
+    def make_github_default_branch_source_target(self, owner, repo, repo_info):
+        branch = repo_info.get("default_branch", "main")
+        return {"url": f"https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip", "name": f"{repo}-{branch}-source.zip", "group": "repository-source", "optional": False}
+
+    def get_github_download_targets(self, repo_url, mode="latest", include_assets=True, include_source=True, release_tag="", include_readme=False, include_license=False):
+        owner, repo, repo_info, releases = self.get_github_repo_info(repo_url)
+        mode = str(mode or "latest").strip().lower()
+        targets = []
+        selected_releases = []
+
+        if mode == "tag":
+            release = self.get_github_release_by_tag(owner, repo, release_tag)
+
+            if not release:
+                raise RuntimeError(f"Release tag was not found: {release_tag}")
+
+            selected_releases = [release]
+
+        elif mode in ["latest", "all_releases"]:
+            selected_releases = releases[:1] if mode == "latest" else releases
+
+        for release in selected_releases:
+            tag = release.get("tag_name") or "release"
+
+            if include_assets:
+                for asset in release.get("assets", []):
+                    url = asset.get("browser_download_url")
+                    name = asset.get("name") or Path(urlparse(url).path).name
+
+                    if url:
+                        targets.append({"url": url, "name": name, "group": f"releases/{self.sanitize_name(tag)}/assets", "optional": False})
+
+            if include_source:
+                zip_url = release.get("zipball_url")
+                tar_url = release.get("tarball_url")
+
+                if zip_url:
+                    targets.append({"url": zip_url, "name": f"{repo}-{tag}-source.zip", "group": f"releases/{self.sanitize_name(tag)}/source", "optional": False})
+
+                if tar_url:
+                    targets.append({"url": tar_url, "name": f"{repo}-{tag}-source.tar.gz", "group": f"releases/{self.sanitize_name(tag)}/source", "optional": False})
+
+        if mode in ["repo_source", "default_branch"]:
+            targets.append(self.make_github_default_branch_source_target(owner, repo, repo_info))
+
+        if include_readme:
+            branch = repo_info.get("default_branch", "main")
+            targets.append({"url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/README.md", "name": "README.md", "group": "repository-files", "optional": True})
+
+        if include_license:
+            branch = repo_info.get("default_branch", "main")
+            for candidate in ["LICENSE", "LICENSE.md", "LICENSE.txt"]:
+                targets.append({"url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{candidate}", "name": candidate, "group": "repository-files/license-candidates", "optional": True})
+
+        required_targets = [item for item in targets if not item.get("optional")]
+
+        if not required_targets and mode in ["latest", "tag"] and include_source:
+            print("No release files found. Falling back to default branch source ZIP.")
+            targets.append(self.make_github_default_branch_source_target(owner, repo, repo_info))
+
+        return owner, repo, repo_info, releases, targets
+
+    def download_file_requests(self, url, destination_file):
+        destination_file = Path(destination_file)
+        destination_file.parent.mkdir(parents=True, exist_ok=True)
+        headers = {"User-Agent": "AzuDl-GC2GD"}
+        token = self.get_github_token()
+
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        with requests.get(url, headers=headers, stream=True, timeout=60, allow_redirects=True) as response:
+            if response.status_code == 403:
+                raise RuntimeError("GitHub download was blocked by rate limit or access restriction.")
+
+            response.raise_for_status()
+            total = int(response.headers.get("content-length", "0") or 0)
+
+            with destination_file.open("wb") as handle:
+                with tqdm(total=total if total > 0 else None, unit="B", unit_scale=True, unit_divisor=1024, desc=destination_file.name) as bar:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        bar.update(len(chunk))
+
+        if not destination_file.exists() or destination_file.stat().st_size <= 0:
+            raise RuntimeError(f"Downloaded file is empty: {destination_file}")
+
+        return destination_file
+
+    def download_github_repository(self, repo_url, mode="latest", include_assets=True, include_source=True, folder_name="", release_tag="", include_readme=False, include_license=False):
+        owner, repo, repo_info, releases, targets = self.get_github_download_targets(repo_url, mode, include_assets, include_source, release_tag, include_readme, include_license)
+
+        if not targets:
+            raise RuntimeError("No downloadable GitHub targets were found for the selected options.")
+
+        folder_name = self.sanitize_name(folder_name or f"{owner}_{repo}")
+        final_base = self.github_dir / folder_name
+        work_dir = self.temp_dir / "GitHub" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        self.print_section("GitHub Download Started")
+        self.print_kv("Repository", f"{owner}/{repo}")
+        self.print_kv("Mode", mode)
+        self.print_kv("Targets", len(targets))
+        self.print_kv("Output folder", final_base)
+
+        transferred = []
+
+        try:
+            for index, target in enumerate(targets, 1):
+                name = self.sanitize_name(target["name"])
+                group = Path(target.get("group", "downloads"))
+                local_file = work_dir / group / name
+
+                self.print_subsection(f"GitHub Target {index} of {len(targets)}")
+                self.print_kv("File", name)
+
+                try:
+                    downloaded = self.download_file_requests(target["url"], local_file)
+                except Exception as error:
+                    if target.get("optional"):
+                        self.print_status(f"Optional file skipped: {name}", "warning")
+                        continue
+                    raise error
+
+                moved = self.safe_transfer_to_drive(downloaded, final_base / group, remove_source=True)
+
+                if moved:
+                    transferred.append(moved)
+                    self.print_kv("Saved", moved)
+
+            if not transferred:
+                raise RuntimeError("GitHub download finished but no files were transferred to Google Drive.")
+
+            self.verify_output_files(final_base, label="GitHub download")
+
+        finally:
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        self.save_history({"type": "github", "source": repo_url, "output": str(final_base), "status": "completed", "mode": mode, "files": [str(item) for item in transferred]})
+        print("GitHub files downloaded, transferred, and verified on Google Drive")
+        print("Saved to:", final_base)
+
+    def download_github_interactive(self, official=False):
+        if official:
+            repo_url = self.official_github_repo_url
+            print("Official repository:", repo_url)
+            default_folder = "AzuDL-GC2GD-Official"
+        else:
+            repo_url = input("GitHub repository URL: ").strip()
+            default_folder = ""
+
+        print("Modes: latest / all_releases / tag / repo_source")
+        mode = input("Mode default repo_source for official, latest otherwise: ").strip() or ("repo_source" if official else "latest")
+        release_tag = ""
+
+        if mode == "tag":
+            release_tag = input("Release tag: ").strip()
+
+        folder_name = input("Output folder optional: ").strip() or default_folder
+        assets = input("Download release assets? y/n default y: ").strip().lower() != "n"
+        source = input("Download source archive? y/n default y: ").strip().lower() != "n"
+        readme = input("Download README? y/n default n: ").strip().lower() == "y"
+        license_file = input("Download License? y/n default n: ").strip().lower() == "y"
+
+        self.download_github_repository(repo_url, mode, assets, source, folder_name, release_tag, readme, license_file)
+
+    def run_system_diagnostic_test(self):
+        self.print_section("AzuDl Diagnostic Test")
+        tests = [
+            ("Direct Download", "direct", "https://raw.githubusercontent.com/github/gitignore/main/Python.gitignore"),
+            ("GitHub API", "github", self.official_github_repo_url),
+            ("YouTube Access", "youtube", "https://www.youtube.com/watch?v=jNQXAC9IVRw"),
+            ("Torrent Engine", "torrent", "magnet:?xt=urn:btih:CD4D8F3BFA8F8F0D3630A1E17EBD0D06ACD0D1C6&dn=debian-test")
+        ]
+        results = []
+
+        for name, kind, value in tests:
+            try:
+                self.print_subsection(name)
+
+                if kind == "direct":
+                    response = requests.get(value, timeout=20)
+                    response.raise_for_status()
+                    if not response.content:
+                        raise RuntimeError("Empty response")
+                    self.print_status("Direct download access OK.", "success")
+                    results.append((name, True, "OK"))
+
+                elif kind == "github":
+                    owner, repo, repo_info, releases = self.get_github_repo_info(value)
+                    self.print_status(f"GitHub API OK for {owner}/{repo}", "success")
+                    results.append((name, True, f"{len(releases)} release(s)"))
+
+                elif kind == "youtube":
+                    with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+                        info = ydl.extract_info(value, download=False)
+                    title = info.get("title", "unknown")
+                    self.print_status(f"YouTube access OK: {title}", "success")
+                    results.append((name, True, title))
+
+                elif kind == "torrent":
+                    gid = self.add_aria2_download([value], self.base_dir / "DiagnosticTorrent", "", self.build_torrent_options(private=False, seed=False))
+                    time.sleep(5)
+                    status = self.get_aria2_status(gid)
+                    state = status.get("status", "unknown")
+                    self.remove_existing_torrent_gid(gid)
+                    if state in ["active", "waiting", "complete"]:
+                        self.print_status("aria2 torrent engine OK.", "success")
+                        results.append((name, True, state))
+                    else:
+                        raise RuntimeError(f"Unexpected aria2 state: {state}")
+
+            except Exception as error:
+                self.print_status(f"{name} failed: {error}", "error")
+                results.append((name, False, str(error)))
+
+        self.print_section("Diagnostic Summary")
+        ok_count = 0
+        for name, success, details in results:
+            status = "PASS" if success else "FAIL"
+            if success:
+                ok_count += 1
+            print(f"{status:<6} {name:<24} {details}")
+        self.print_kv("Passed", f"{ok_count}/{len(results)}")
+
+    def force_drive_sync_interactive(self):
+        self.force_drive_sync()
+        print("Drive sync command completed")
+
+    def storage_report(self):
+        total, used, free = shutil.disk_usage(str(self.my_drive_path))
+
+        print("Google Drive mount storage")
+        print("-" * 80)
+        print("Total:", self.format_bytes(total))
+        print("Used:", self.format_bytes(used))
+        print("Free:", self.format_bytes(free))
+
+        print("")
+        print("Project folders")
+        print("-" * 80)
+
+        folders = [
+            self.torrent_dir,
+            self.youtube_dir,
+            self.direct_dir,
+            self.batch_dir,
+            self.github_dir,
+            self.archive_dir,
+            self.logs_dir
+        ]
+
+        for folder in folders:
+            print(self.format_bytes(self.folder_size(folder)), folder)
+
+    def folder_size(self, folder):
+        folder = Path(folder)
+
+        if not folder.exists():
+            return 0
+
+        total = 0
+
+        for item in folder.glob("**/*"):
+            if item.is_file():
+                try:
+                    total += item.stat().st_size
+                except Exception:
+                    pass
+
+        return total
+
+    def sha256_file(self, file_path):
+        file_path = Path(file_path)
+
+        if not file_path.exists():
+            raise FileNotFoundError(file_path)
+
+        if not file_path.is_file():
+            raise ValueError("Path is not a file")
+
+        h = hashlib.sha256()
+        total = file_path.stat().st_size
+
+        with file_path.open("rb") as f, tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, desc="SHA256") as bar:
+            while True:
+                chunk = f.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                h.update(chunk)
+                bar.update(len(chunk))
+
+        return h.hexdigest()
+
+    def hash_latest_file(self):
+        latest = self.get_latest_file()
+
+        if not latest:
+            print("No files found")
+            return
+
+        print("Latest file:", latest)
+        print("Size:", self.format_bytes(latest.stat().st_size))
+
+        digest = self.sha256_file(latest)
+
+        print("SHA256:")
+        print(digest)
+
+    def sha256_selected_file(self):
+        file_path = self.select_file()
+
+        if not file_path:
+            return
+
+        digest = self.sha256_file(file_path)
+
+        print("File:", file_path)
+        print("SHA256:", digest)
+
+    def zip_folder(self):
+        source = input("Folder path to zip: ").strip()
+
+        if not source:
+            print("No folder path entered")
+            return
+
+        source_path = Path(source)
+
+        if not source_path.exists():
+            print("Folder does not exist")
+            return
+
+        if not source_path.is_dir():
+            print("Path is not a folder")
+            return
+
+        output_name = input("Output zip name optional: ").strip()
+
+        if not output_name:
+            output_name = source_path.name + "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        output_name = self.sanitize_name(output_name)
+        output_base = self.archive_dir / output_name
+
+        print("Creating ZIP...")
+        result = shutil.make_archive(str(output_base), "zip", str(source_path))
+
+        print("ZIP created:")
+        print(result)
+
+        self.save_history({
+            "type": "zip",
+            "source": str(source_path),
+            "output": result,
+            "status": "completed"
+        })
+
+    def zip_latest_folder(self):
+        latest_folder = self.get_latest_downloaded_folder()
+
+        if not latest_folder:
+            print("No folders found")
+            return
+
+        print("Latest folder:")
+        print(latest_folder)
+
+        confirm = input("Zip this folder? y/n: ").strip().lower()
+
+        if confirm != "y":
+            print("Cancelled")
+            return
+
+        output_name = latest_folder.name + "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_name = self.sanitize_name(output_name)
+        output_base = self.archive_dir / output_name
+
+        print("Creating ZIP...")
+        result = shutil.make_archive(str(output_base), "zip", str(latest_folder))
+
+        print("ZIP created:")
+        print(result)
+
+        self.save_history({
+            "type": "zip",
+            "source": str(latest_folder),
+            "output": result,
+            "status": "completed"
+        })
+
+    def print_developer(self):
+        text = """
+Developer
+
+Project:
+AzuDl - GC2GD
+
+Full Name:
+Azizi Universal Downloader - Google Colab to Google Drive
+
+Developer:
+The Azizi
+
+X:
+https://x.com/the_azzi
+
+GitHub:
+https://github.com/TheGreatAzizi
+
+Telegram:
+https://t.me/luluch_code
+
+Git:
+https://git.theazizi.ir/TheAzizi
+
+Website:
+https://theazizi.ir
+"""
+        print(text.strip())
+
+    def print_help(self):
+        text = """
+AzuDl - GC2GD Help
+
+Project:
+AzuDl - GC2GD
+
+Full Name:
+Azizi Universal Downloader - Google Colab to Google Drive
+
+Main options:
+1. Auto detect link
+2. Torrent tools
+3. YouTube video or playlist
+4. Direct link
+5. Batch download
+6. Download history
+7. List downloaded files
+8. Storage report
+9. SHA256 latest file
+10. SHA256 selected file
+11. ZIP folder
+12. ZIP latest folder
+13. Latest file
+14. Developer
+15. Help
+16. GitHub repository downloader
+17. Official project repository
+18. YouTube auth tools
+19. GitHub token tools
+20. Run diagnostic
+21. Force Drive sync
+22. Exit
+
+Torrent tools:
+1. Torrent magnet
+2. Torrent file
+3. Private torrent
+4. aria2 status
+5. Remove aria2 GID
+6. Clear stopped aria2 results
+7. Save aria2 session
+8. Back
+
+YouTube quality selection:
+AzuDl fetches video info before asking quality.
+Only qualities that actually exist in the video are shown.
+Audio is always merged into the video — silent downloads are not possible.
+For audio-only downloads, the output is saved as MP3 at 320kbps.
+
+Resume support:
+AzuDl uses aria2 session persistence.
+Session file:
+/content/drive/MyDrive/AzuDl-GC2GD/Logs/aria2.session
+
+Duplicate torrent handling:
+AzuDl reads torrent InfoHash before adding .torrent files.
+If the same torrent already exists in aria2, it resumes or monitors the existing GID instead of adding a duplicate.
+If the existing torrent is in error state, AzuDl removes it and adds the torrent again.
+
+Google Colab may disconnect idle or long-running sessions.
+AzuDl does not bypass Colab timeout.
+After reconnecting, run the notebook again and check aria2 status.
+
+Private torrent:
+Use this option for private tracker torrents.
+Using a .torrent file is strongly recommended.
+Private mode disables DHT, DHT6, PEX, and LPD.
+If seeding is enabled, aria2 keeps seeding while the Colab runtime is alive.
+Google Colab is not suitable for permanent seeding.
+For long-term seeding, use a seedbox or VPS.
+
+Torrent seeding:
+AzuDl uses 525600 minutes when seeding is enabled.
+Live seeding status shows upload speed, uploaded size, ratio, connections, seeders, and elapsed time.
+
+Direct headers:
+You can pass optional headers as JSON.
+Example:
+{"User-Agent":"Mozilla/5.0","Referer":"https://example.com"}
+
+Speed limit examples:
+500K
+2M
+10M
+
+GitHub downloader:
+AzuDl can download latest release, all releases, a specific release tag, or the default branch source ZIP.
+For private repositories or higher API limits, save a GitHub token in GitHub token tools.
+
+YouTube auth:
+AzuDl supports cookies.txt, PO Token, Visitor Data, and player client settings.
+Keep real cookies and tokens private.
+
+Diagnostic:
+Run diagnostic tests Direct, GitHub API, YouTube metadata, and aria2 torrent engine.
+
+Drive transfer:
+Some downloads are processed locally first, then copied to Google Drive with verification.
+If Drive UI does not show files immediately, refresh Drive or run Force Drive sync.
+
+Notes:
+Use only content you have the right to download.
+Private torrent seeding stops when Colab runtime disconnects.
+"""
+        print(text.strip())
+
+
+def main():
+    app = AzuDlGC2GD()
+
+    try:
+        app.setup()
+    except Exception as error:
+        print("Startup failed:", error)
+        return
+
+    while True:
+        print("")
+        print("=" * 70)
+        print(app.project_name)
+        print("=" * 70)
+        print("1. Auto detect link")
+        print("2. Torrent tools")
+        print("3. YouTube video or playlist")
+        print("4. Direct link")
+        print("5. Batch download")
+        print("6. Download history")
+        print("7. List downloaded files")
+        print("8. Storage report")
+        print("9. SHA256 latest file")
+        print("10. SHA256 selected file")
+        print("11. ZIP folder")
+        print("12. ZIP latest folder")
+        print("13. Latest file")
+        print("14. Developer")
+        print("15. Help")
+        print("16. GitHub repository downloader")
+        print("17. Official project repository")
+        print("18. YouTube auth tools")
+        print("19. GitHub token tools")
+        print("20. Run diagnostic")
+        print("21. Force Drive sync")
+        print("22. Exit")
+
+        choice = input("Select option: ").strip()
+
+        try:
+            if choice == "1":
+                value = input("Link: ").strip()
+                app.auto_download(value)
+
+            elif choice == "2":
+                app.torrent_menu()
+
+            elif choice == "3":
+                url = input("YouTube URL: ").strip()
+                folder_name = input("Folder name optional: ").strip()
+                quality, audio_only = app.select_youtube_quality(url)
+                playlist_answer = input("Download playlist if detected? y/n: ").strip().lower()
+                playlist = playlist_answer != "n"
+                metadata_answer = input("Save metadata and thumbnail? y/n: ").strip().lower()
+                metadata = metadata_answer == "y"
+
+                app.download_youtube(
+                    url=url,
+                    folder_name=folder_name,
+                    quality=quality,
+                    audio_only=audio_only,
+                    playlist=playlist,
+                    metadata=metadata
+                )
+
+            elif choice == "4":
+                url = input("Direct URL: ").strip()
+                folder_name = input("Folder name optional: ").strip()
+                file_name = input("File name optional: ").strip()
+                speed_limit = input("Speed limit optional, example 5M: ").strip()
+                headers_text = input('Headers JSON optional, example {"User-Agent":"Mozilla/5.0"}: ').strip()
+                headers = app.parse_headers_json(headers_text)
+                app.download_direct(url, folder_name, file_name, speed_limit, headers)
+
+            elif choice == "5":
+                app.batch_download()
+
+            elif choice == "6":
+                app.print_history()
+
+            elif choice == "7":
+                app.list_downloads()
+
+            elif choice == "8":
+                app.storage_report()
+
+            elif choice == "9":
+                app.hash_latest_file()
+
+            elif choice == "10":
+                app.sha256_selected_file()
+
+            elif choice == "11":
+                app.zip_folder()
+
+            elif choice == "12":
+                app.zip_latest_folder()
+
+            elif choice == "13":
+                app.print_latest_file()
+
+            elif choice == "14":
+                app.print_developer()
+
+            elif choice == "15":
+                app.print_help()
+
+            elif choice == "16":
+                app.download_github_interactive(official=False)
+
+            elif choice == "17":
+                app.download_github_interactive(official=True)
+
+            elif choice == "18":
+                print("1. YouTube auth status")
+                print("2. Save cookies")
+                print("3. Save PO Token")
+                print("4. Help")
+                sub = input("Select: ").strip()
+
+                if sub == "1":
+                    app.print_youtube_auth_status()
+                elif sub == "2":
+                    app.save_youtube_cookies_interactive()
+                elif sub == "3":
+                    app.save_youtube_po_token_interactive()
+                elif sub == "4":
+                    app.print_youtube_auth_help()
+                else:
+                    print("Invalid option")
+
+            elif choice == "19":
+                print("1. GitHub auth status")
+                print("2. Save GitHub token")
+                print("3. Clear GitHub token")
+                sub = input("Select: ").strip()
+
+                if sub == "1":
+                    app.print_github_auth_status()
+                elif sub == "2":
+                    app.save_github_token_interactive()
+                elif sub == "3":
+                    app.clear_github_token()
+                else:
+                    print("Invalid option")
+
+            elif choice == "20":
+                app.run_system_diagnostic_test()
+
+            elif choice == "21":
+                app.force_drive_sync_interactive()
+
+            elif choice == "22":
+                app.save_aria2_session()
+                print("Exit")
+                break
+
+            else:
+                print("Invalid option")
+
+        except KeyboardInterrupt:
+            app.save_aria2_session()
+            print("Cancelled")
+
+        except Exception as error:
+            app.save_aria2_session()
+            print("Error:", error)
+
+
+if __name__ == "__main__":
+    main()
